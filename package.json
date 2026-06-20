@@ -1,0 +1,20 @@
+{
+  "name": "jmc-ops-tracker",
+  "version": "1.0.0",
+  "description": "Drona ValueChain - JMC Operations Monitoring and Tracking System",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js",
+    "seed": "node db.js --seed",
+    "dev": "node server.js"
+  },
+  "engines": {
+    "node": ">=22.5"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "cookie-parser": "^1.4.6",
+    "express": "^4.19.2"
+  }
+}

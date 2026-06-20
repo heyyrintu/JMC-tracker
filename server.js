@@ -1,0 +1,881 @@
+/**
+ * Drona ValueChain — JMC Operations Tracker
+ * Express API + static frontend.
+ */
+const path = require('path');
+const fs = require('fs');
+const crypto = require('crypto');
+const express = require('express');
+const cookieParser = require('cookie-parser');
+const bcrypt = require('bcryptjs');
+const { db, getSetting, setSetting, seed } = require('./db');
+const config = require('./config');
+
+// Ensure defaults exist on boot.
+seed();
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+// Folder for uploaded proof photos.
+const UPLOAD_DIR = process.env.UPLOAD_DIR || path.join(__dirname, 'uploads');
+fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+
+app.use(express.json({ limit: '12mb' })); // room for base64 photos (client pre-resizes)
+app.use(cookieParser());
+app.use('/uploads', express.static(UPLOAD_DIR));
+
+// ---- Helpers --------------------------------------------------------------
+function audit(userId, action, detail) {
+  db.prepare('INSERT INTO audit_log (user_id, action, detail) VALUES (?, ?, ?)')
+    .run(userId || null, action, detail ? JSON.stringify(detail) : null);
+}
+function publicUser(u) {
+  if (!u) return null;
+  return { id: u.id, name: u.name, username: u.username, role: u.role, company: u.company,
+           roleLabel: config.ROLES[u.role] || u.role };
+}
+function currentUser(req) {
+  const token = req.cookies.sid;
+  if (!token) return null;
+  const row = db.prepare(`SELECT u.* FROM sessions s JOIN users u ON u.id = s.user_id
+                          WHERE s.token = ? AND u.active = 1`).get(token);
+  return row || null;
+}
+function auth(req, res, next) {
+  const u = currentUser(req);
+  if (!u) return res.status(401).json({ error: 'Not authenticated' });
+  req.user = u;
+  next();
+}
+function requireRole(...roles) {
+  return (req, res, next) => {
+    if (!req.user || !roles.includes(req.user.role))
+      return res.status(403).json({ error: 'Not permitted for your role' });
+    next();
+  };
+}
+
+// ---- Auth -----------------------------------------------------------------
+app.post('/api/login', (req, res) => {
+  const { username, password } = req.body || {};
+  const u = db.prepare('SELECT * FROM users WHERE username = ? AND active = 1').get((username || '').trim());
+  if (!u || !bcrypt.compareSync(password || '', u.password_hash))
+    return res.status(401).json({ error: 'Invalid username or password' });
+  const token = crypto.randomBytes(24).toString('hex');
+  db.prepare('INSERT INTO sessions (token, user_id) VALUES (?, ?)').run(token, u.id);
+  res.cookie('sid', token, { httpOnly: true, sameSite: 'lax', maxAge: 1000 * 60 * 60 * 12 });
+  audit(u.id, 'LOGIN');
+  res.json({ user: publicUser(u) });
+});
+
+app.post('/api/logout', auth, (req, res) => {
+  db.prepare('DELETE FROM sessions WHERE token = ?').run(req.cookies.sid);
+  res.clearCookie('sid');
+  res.json({ ok: true });
+});
+
+app.get('/api/me', (req, res) => {
+  const u = currentUser(req);
+  res.json({ user: publicUser(u), config: clientConfig() });
+});
+
+function clientConfig() {
+  return {
+    company: config.COMPANY,
+    roles: config.ROLES,
+    showBilling: !!getSetting('show_billing', false),
+    rates: getSetting('rates', config.RATES),
+    mg: getSetting('mg', config.MG),
+    approvedManpower: getSetting('approved_manpower', config.APPROVED_MANPOWER),
+    vehicleTypes: config.VEHICLE_TYPES,
+    locations: config.COMMON_LOCATIONS,
+    workingDays: config.WORKING_DAYS_PER_MONTH,
+    ppmTarget: getSetting('ppm_target', config.PPM_TARGET),
+    invoice: getSetting('invoice', config.INVOICE),
+    costs: getSetting('costs', config.COSTS),
+    mgBilling: !!getSetting('mg_billing', config.MG_BILLING),
+    leaveTypes: config.LEAVE_TYPES,
+    leavePolicy: getSetting('leave_policy', config.LEAVE_POLICY),
+  };
+}
+
+// Resolve a transport trip's rate from the configured route table.
+function transportRate(from, to, vehicle) {
+  const rates = getSetting('transport_rates', config.TRANSPORT_RATES);
+  const m = rates.find(r => r.from === from && r.to === to && r.vehicle === vehicle);
+  return m ? m.rate : null;
+}
+
+// ---- Entry assembly -------------------------------------------------------
+function loadEntry(id) {
+  const e = db.prepare('SELECT * FROM daily_entries WHERE id = ?').get(id);
+  if (!e) return null;
+  e.manpower = db.prepare('SELECT category, approved_count, actual_count FROM manpower_actual WHERE entry_id = ?').all(id);
+  e.loading = db.prepare('SELECT parts_qty, manpower_count, truck_count FROM loading WHERE entry_id = ?').get(id)
+              || { parts_qty: 0, manpower_count: 0, truck_count: 0 };
+  e.unloading = db.prepare('SELECT truck_count, weight_ton, manpower_count FROM unloading WHERE entry_id = ?').get(id)
+              || { truck_count: 0, weight_ton: 0, manpower_count: 0 };
+  e.qc = db.prepare('SELECT parts_qty, manpower_count FROM qc WHERE entry_id = ?').get(id)
+              || { parts_qty: 0, manpower_count: 0 };
+  e.transport = db.prepare('SELECT id, from_loc, to_loc, vehicle_type, trip_time, remarks FROM transport_trips WHERE entry_id = ? ORDER BY trip_time').all(id);
+  e.attachments = db.prepare(`SELECT a.id, a.filename, a.caption, a.created_at, u.name AS uploaded_by_name
+    FROM attachments a LEFT JOIN users u ON u.id = a.uploaded_by WHERE a.entry_id = ? ORDER BY a.id`).all(id)
+    .map(a => ({ ...a, url: '/uploads/' + a.filename }));
+  const mg = getSetting('mg', config.MG);
+  e.mg_target = mg.qc_daily_parts;
+  e.mg_shortfall = Math.max(0, mg.qc_daily_parts - e.qc.parts_qty);
+  e.mg_met = e.qc.parts_qty >= mg.qc_daily_parts;
+  e.created_by_name = e.created_by ? (db.prepare('SELECT name FROM users WHERE id=?').get(e.created_by)||{}).name : null;
+  e.approved_by_name = e.approved_by ? (db.prepare('SELECT name FROM users WHERE id=?').get(e.approved_by)||{}).name : null;
+  return e;
+}
+
+// ---- Entries: list --------------------------------------------------------
+app.get('/api/entries', auth, (req, res) => {
+  const { from, to, status, month } = req.query;
+  let sql = 'SELECT id, work_date, status, shift, submitted_at, approved_at FROM daily_entries WHERE 1=1';
+  const args = [];
+  if (from) { sql += ' AND work_date >= ?'; args.push(from); }
+  if (to)   { sql += ' AND work_date <= ?'; args.push(to); }
+  if (month){ sql += " AND substr(work_date,1,7) = ?"; args.push(month); }
+  if (status){ sql += ' AND status = ?'; args.push(status); }
+  sql += ' ORDER BY work_date DESC LIMIT 400';
+  res.json({ entries: db.prepare(sql).all(...args) });
+});
+
+app.get('/api/entries/:id', auth, (req, res) => {
+  const e = loadEntry(Number(req.params.id));
+  if (!e) return res.status(404).json({ error: 'Not found' });
+  res.json({ entry: e });
+});
+
+// Get-or-create the entry for a date (operator workspace).
+app.get('/api/entry-by-date/:date', auth, (req, res) => {
+  const date = req.params.date;
+  let row = db.prepare('SELECT id FROM daily_entries WHERE work_date = ?').get(date);
+  if (!row) return res.json({ entry: null });
+  res.json({ entry: loadEntry(row.id) });
+});
+
+// ---- Entries: create/update (Operator only, while editable) ---------------
+function isEditable(status) { return status === 'DRAFT' || status === 'REJECTED'; }
+
+app.post('/api/entries', auth, requireRole('OPERATOR', 'ADMIN'), (req, res) => {
+  const b = req.body || {};
+  if (!b.work_date) return res.status(400).json({ error: 'work_date required' });
+
+  const approved = getSetting('approved_manpower', config.APPROVED_MANPOWER);
+  const approvedMap = Object.fromEntries(approved.map(a => [a.category, a.approved]));
+
+  const tx = db.transaction(() => {
+    const ppmVal = (b.ppm != null && b.ppm !== '') ? Number(b.ppm) : null;
+    let entry = db.prepare('SELECT * FROM daily_entries WHERE work_date = ?').get(b.work_date);
+    let entryId;
+    if (!entry) {
+      const info = db.prepare(`INSERT INTO daily_entries (work_date, status, shift, notes, ppm, created_by)
+                               VALUES (?, 'DRAFT', ?, ?, ?, ?)`)
+                     .run(b.work_date, b.shift || 'DAY', b.notes || null, ppmVal, req.user.id);
+      entryId = info.lastInsertRowid;
+    } else {
+      if (!isEditable(entry.status))
+        throw Object.assign(new Error('Entry is locked (already submitted/approved)'), { http: 409 });
+      entryId = entry.id;
+      db.prepare(`UPDATE daily_entries SET shift=?, notes=?, ppm=?, status='DRAFT', updated_at=datetime('now') WHERE id=?`)
+        .run(b.shift || 'DAY', b.notes || null, ppmVal, entryId);
+    }
+
+    // Manpower
+    db.prepare('DELETE FROM manpower_actual WHERE entry_id = ?').run(entryId);
+    const mpIns = db.prepare(`INSERT INTO manpower_actual (entry_id, category, approved_count, actual_count)
+                              VALUES (?, ?, ?, ?)`);
+    for (const m of (b.manpower || [])) {
+      mpIns.run(entryId, m.category, approvedMap[m.category] ?? 0, Number(m.actual_count) || 0);
+    }
+
+    // Loading
+    const L = b.loading || {};
+    db.prepare(`INSERT INTO loading (entry_id, parts_qty, manpower_count, truck_count) VALUES (?,?,?,?)
+                ON CONFLICT(entry_id) DO UPDATE SET parts_qty=excluded.parts_qty,
+                manpower_count=excluded.manpower_count, truck_count=excluded.truck_count`)
+      .run(entryId, +L.parts_qty||0, +L.manpower_count||0, +L.truck_count||0);
+
+    // Unloading
+    const U = b.unloading || {};
+    db.prepare(`INSERT INTO unloading (entry_id, truck_count, weight_ton, manpower_count) VALUES (?,?,?,?)
+                ON CONFLICT(entry_id) DO UPDATE SET truck_count=excluded.truck_count,
+                weight_ton=excluded.weight_ton, manpower_count=excluded.manpower_count`)
+      .run(entryId, +U.truck_count||0, +U.weight_ton||0, +U.manpower_count||0);
+
+    // QC
+    const Q = b.qc || {};
+    db.prepare(`INSERT INTO qc (entry_id, parts_qty, manpower_count) VALUES (?,?,?)
+                ON CONFLICT(entry_id) DO UPDATE SET parts_qty=excluded.parts_qty,
+                manpower_count=excluded.manpower_count`)
+      .run(entryId, +Q.parts_qty||0, +Q.manpower_count||0);
+
+    // Transport
+    db.prepare('DELETE FROM transport_trips WHERE entry_id = ?').run(entryId);
+    const tIns = db.prepare(`INSERT INTO transport_trips (entry_id, from_loc, to_loc, vehicle_type, trip_time, remarks)
+                             VALUES (?,?,?,?,?,?)`);
+    for (const t of (b.transport || [])) {
+      if (!t.from_loc || !t.to_loc || !t.vehicle_type) continue;
+      tIns.run(entryId, t.from_loc, t.to_loc, t.vehicle_type, t.trip_time || null, t.remarks || null);
+    }
+
+    if (b.submit) {
+      db.prepare(`UPDATE daily_entries SET status='SUBMITTED', submitted_at=datetime('now'),
+                  jmc_remarks=NULL, updated_at=datetime('now') WHERE id=?`).run(entryId);
+    }
+    return entryId;
+  });
+
+  try {
+    const id = tx();
+    audit(req.user.id, b.submit ? 'ENTRY_SUBMIT' : 'ENTRY_SAVE', { date: b.work_date });
+    res.json({ entry: loadEntry(id) });
+  } catch (err) {
+    res.status(err.http || 500).json({ error: err.message });
+  }
+});
+
+// ---- Photo attachments (proof of work) ------------------------------------
+app.post('/api/entries/:id/attachments', auth, requireRole('OPERATOR', 'ADMIN'), (req, res) => {
+  const e = db.prepare('SELECT * FROM daily_entries WHERE id = ?').get(Number(req.params.id));
+  if (!e) return res.status(404).json({ error: 'Entry not found' });
+  if (!isEditable(e.status)) return res.status(409).json({ error: 'Day is locked — cannot add photos' });
+  const { dataUrl, caption } = req.body || {};
+  const m = /^data:image\/(png|jpeg|jpg|webp);base64,(.+)$/.exec(dataUrl || '');
+  if (!m) return res.status(400).json({ error: 'Invalid image' });
+  const ext = m[1] === 'jpeg' ? 'jpg' : m[1];
+  const buf = Buffer.from(m[2], 'base64');
+  if (buf.length > 6 * 1024 * 1024) return res.status(413).json({ error: 'Image too large (max ~6MB)' });
+  const filename = `att_${e.id}_${Date.now()}_${crypto.randomBytes(3).toString('hex')}.${ext}`;
+  fs.writeFileSync(path.join(UPLOAD_DIR, filename), buf);
+  db.prepare('INSERT INTO attachments (entry_id, filename, caption, uploaded_by) VALUES (?,?,?,?)')
+    .run(e.id, filename, caption || null, req.user.id);
+  audit(req.user.id, 'PHOTO_ADD', { entry: e.id });
+  res.json({ ok: true });
+});
+
+app.delete('/api/attachments/:id', auth, requireRole('OPERATOR', 'ADMIN'), (req, res) => {
+  const a = db.prepare('SELECT a.*, e.status FROM attachments a JOIN daily_entries e ON e.id=a.entry_id WHERE a.id=?').get(Number(req.params.id));
+  if (!a) return res.status(404).json({ error: 'Not found' });
+  if (!isEditable(a.status)) return res.status(409).json({ error: 'Day is locked' });
+  try { fs.unlinkSync(path.join(UPLOAD_DIR, a.filename)); } catch (_) {}
+  db.prepare('DELETE FROM attachments WHERE id = ?').run(a.id);
+  res.json({ ok: true });
+});
+
+// ---- Discrepancies (concern areas) ----------------------------------------
+function loadDisc(id) {
+  return db.prepare(`SELECT d.*, ru.name AS raised_by_name, sv.name AS resolved_by_name,
+    (COALESCE(d.qty_dispatched,0) - COALESCE(d.qty_billed,0)) AS variance
+    FROM discrepancies d
+    LEFT JOIN users ru ON ru.id = d.raised_by
+    LEFT JOIN users sv ON sv.id = d.resolved_by WHERE d.id = ?`).get(id);
+}
+
+app.get('/api/discrepancies', auth, (req, res) => {
+  const { status, type, month } = req.query;
+  let sql = `SELECT d.*, ru.name AS raised_by_name, sv.name AS resolved_by_name,
+    (COALESCE(d.qty_dispatched,0) - COALESCE(d.qty_billed,0)) AS variance
+    FROM discrepancies d
+    LEFT JOIN users ru ON ru.id = d.raised_by
+    LEFT JOIN users sv ON sv.id = d.resolved_by WHERE 1=1`;
+  const args = [];
+  if (status) { sql += ' AND d.status = ?'; args.push(status); }
+  if (type) { sql += ' AND d.type = ?'; args.push(type); }
+  if (month) { sql += ' AND substr(d.disc_date,1,7) = ?'; args.push(month); }
+  sql += ' ORDER BY d.status DESC, d.created_at DESC LIMIT 400';
+  res.json({ discrepancies: db.prepare(sql).all(...args) });
+});
+
+app.post('/api/discrepancies', auth, requireRole('OPERATOR', 'JMC_APPROVER', 'ADMIN'), (req, res) => {
+  const b = req.body || {};
+  const types = ['DISPATCH_VS_BILL','WRONG_PART','QR_ISSUE','TPH_HYZINE','OTHER'];
+  if (!types.includes(b.type)) return res.status(400).json({ error: 'Invalid type' });
+  const sev = ['LOW','MEDIUM','HIGH'].includes(b.severity) ? b.severity : 'MEDIUM';
+  const info = db.prepare(`INSERT INTO discrepancies
+    (disc_date, type, part_no, description, qty_dispatched, qty_billed, qr_code, severity, raised_by, raised_company)
+    VALUES (?,?,?,?,?,?,?,?,?,?)`)
+    .run(b.disc_date || new Date().toISOString().slice(0,10), b.type, b.part_no || null, b.description || null,
+      b.qty_dispatched != null && b.qty_dispatched !== '' ? Number(b.qty_dispatched) : null,
+      b.qty_billed != null && b.qty_billed !== '' ? Number(b.qty_billed) : null,
+      b.qr_code || null, sev, req.user.id, req.user.company);
+  audit(req.user.id, 'DISC_RAISE', { id: info.lastInsertRowid, type: b.type });
+  res.json({ discrepancy: loadDisc(info.lastInsertRowid) });
+});
+
+app.post('/api/discrepancies/:id/resolve', auth, requireRole('OPERATOR', 'JMC_APPROVER', 'ADMIN'), (req, res) => {
+  const d = db.prepare('SELECT * FROM discrepancies WHERE id = ?').get(Number(req.params.id));
+  if (!d) return res.status(404).json({ error: 'Not found' });
+  if (d.status === 'RESOLVED') return res.status(409).json({ error: 'Already resolved' });
+  db.prepare(`UPDATE discrepancies SET status='RESOLVED', resolution=?, resolved_by=?, resolved_at=datetime('now') WHERE id=?`)
+    .run((req.body || {}).resolution || null, req.user.id, d.id);
+  audit(req.user.id, 'DISC_RESOLVE', { id: d.id });
+  res.json({ discrepancy: loadDisc(d.id) });
+});
+
+// ---- EOD approval (JMC) ---------------------------------------------------
+app.post('/api/entries/:id/decision', auth, requireRole('JMC_APPROVER', 'ADMIN'), (req, res) => {
+  const { decision, remarks } = req.body || {};
+  const e = db.prepare('SELECT * FROM daily_entries WHERE id = ?').get(Number(req.params.id));
+  if (!e) return res.status(404).json({ error: 'Not found' });
+  if (e.status !== 'SUBMITTED')
+    return res.status(409).json({ error: 'Only submitted entries can be approved/rejected' });
+  if (!['APPROVE', 'REJECT'].includes(decision))
+    return res.status(400).json({ error: 'decision must be APPROVE or REJECT' });
+  const status = decision === 'APPROVE' ? 'APPROVED' : 'REJECTED';
+  db.prepare(`UPDATE daily_entries SET status=?, approved_by=?, approved_at=datetime('now'),
+              jmc_remarks=?, updated_at=datetime('now') WHERE id=?`)
+    .run(status, req.user.id, remarks || null, e.id);
+  audit(req.user.id, 'ENTRY_' + status, { date: e.work_date, remarks });
+  res.json({ entry: loadEntry(e.id) });
+});
+
+// ---- Manpower requests ----------------------------------------------------
+app.get('/api/manpower-requests', auth, (req, res) => {
+  const { status } = req.query;
+  let sql = `SELECT r.*, ru.name AS requested_by_name, du.name AS decided_by_name
+             FROM manpower_requests r
+             LEFT JOIN users ru ON ru.id = r.requested_by
+             LEFT JOIN users du ON du.id = r.decided_by WHERE 1=1`;
+  const args = [];
+  if (status) { sql += ' AND r.status = ?'; args.push(status); }
+  sql += ' ORDER BY r.created_at DESC LIMIT 200';
+  res.json({ requests: db.prepare(sql).all(...args) });
+});
+
+app.post('/api/manpower-requests', auth, requireRole('OPERATOR', 'ADMIN'), (req, res) => {
+  const b = req.body || {};
+  if (!b.category || !b.extra_count) return res.status(400).json({ error: 'category and extra_count required' });
+  const info = db.prepare(`INSERT INTO manpower_requests
+    (req_date, needed_date, category, extra_count, reason, ppm_current, requested_by)
+    VALUES (date('now'), ?, ?, ?, ?, ?, ?)`)
+    .run(b.needed_date || null, b.category, Number(b.extra_count), b.reason || null,
+         b.ppm_current != null ? Number(b.ppm_current) : null, req.user.id);
+  audit(req.user.id, 'MP_REQUEST', { id: info.lastInsertRowid });
+  res.json({ id: info.lastInsertRowid });
+});
+
+app.post('/api/manpower-requests/:id/decision', auth, requireRole('HQ', 'ADMIN'), (req, res) => {
+  const { decision, remarks } = req.body || {};
+  const r = db.prepare('SELECT * FROM manpower_requests WHERE id = ?').get(Number(req.params.id));
+  if (!r) return res.status(404).json({ error: 'Not found' });
+  if (r.status !== 'PENDING') return res.status(409).json({ error: 'Already decided' });
+  if (!['APPROVE', 'REJECT'].includes(decision)) return res.status(400).json({ error: 'Invalid decision' });
+  const status = decision === 'APPROVE' ? 'APPROVED' : 'REJECTED';
+  db.prepare(`UPDATE manpower_requests SET status=?, decided_by=?, decided_at=datetime('now'), decision_remarks=? WHERE id=?`)
+    .run(status, req.user.id, remarks || null, r.id);
+  audit(req.user.id, 'MP_' + status, { id: r.id });
+  res.json({ ok: true });
+});
+
+// ---- Reports / dashboard --------------------------------------------------
+app.get('/api/summary', auth, (req, res) => {
+  const month = req.query.month || new Date().toISOString().slice(0, 7);
+  const rows = db.prepare(`
+    SELECT e.id, e.work_date, e.status,
+      COALESCE(l.parts_qty,0) load_parts, COALESCE(l.truck_count,0) load_trucks, COALESCE(l.manpower_count,0) load_mp,
+      COALESCE(u.truck_count,0) unload_trucks, COALESCE(u.weight_ton,0) unload_ton,
+      COALESCE(q.parts_qty,0) qc_parts, COALESCE(q.manpower_count,0) qc_mp,
+      (SELECT COUNT(*) FROM transport_trips t WHERE t.entry_id = e.id) trips,
+      (SELECT COALESCE(SUM(actual_count),0) FROM manpower_actual m WHERE m.entry_id = e.id) mp_actual
+    FROM daily_entries e
+    LEFT JOIN loading l ON l.entry_id = e.id
+    LEFT JOIN unloading u ON u.entry_id = e.id
+    LEFT JOIN qc q ON q.entry_id = e.id
+    WHERE substr(e.work_date,1,7) = ?
+    ORDER BY e.work_date`).all(month);
+
+  const mg = getSetting('mg', config.MG).qc_daily_parts;
+  const totals = rows.reduce((t, r) => {
+    t.load_parts += r.load_parts; t.load_trucks += r.load_trucks;
+    t.unload_trucks += r.unload_trucks; t.unload_ton += r.unload_ton;
+    t.qc_parts += r.qc_parts; t.trips += r.trips;
+    if (r.status === 'APPROVED') t.approved_days++;
+    if (r.qc_parts > 0 && r.qc_parts < mg) t.mg_short_days++;
+    return t;
+  }, { load_parts:0, load_trucks:0, unload_trucks:0, unload_ton:0, qc_parts:0, trips:0, approved_days:0, mg_short_days:0 });
+
+  res.json({ month, mg_target: mg, days: rows, totals,
+    pending_approvals: db.prepare("SELECT COUNT(*) c FROM daily_entries WHERE status='SUBMITTED'").get().c,
+    pending_mp_requests: db.prepare("SELECT COUNT(*) c FROM manpower_requests WHERE status='PENDING'").get().c,
+    open_discrepancies: db.prepare("SELECT COUNT(*) c FROM discrepancies WHERE status='OPEN'").get().c,
+    pending_leaves: db.prepare("SELECT COUNT(*) c FROM leave_applications WHERE status='PENDING'").get().c,
+    expiring_docs: db.prepare("SELECT COUNT(*) c FROM worker_documents WHERE expiry_date IS NOT NULL AND expiry_date <= date('now','+45 days')").get().c });
+});
+
+// ---- Billing / Invoice / P&L (Drona internal) -----------------------------
+app.get('/api/billing', auth, requireRole('ADMIN', 'HQ'), (req, res) => {
+  const month = req.query.month || new Date().toISOString().slice(0, 7);
+  const rates = getSetting('rates', config.RATES);
+  const mg = getSetting('mg', config.MG).qc_daily_parts;
+  const mgBilling = !!getSetting('mg_billing', config.MG_BILLING);
+  const costs = getSetting('costs', config.COSTS);
+  const invoice = getSetting('invoice', config.INVOICE);
+
+  // Quantities
+  const agg = db.prepare(`SELECT
+      COALESCE(SUM(l.parts_qty),0) load_parts,
+      COALESCE(SUM(u.weight_ton),0) unload_ton
+    FROM daily_entries e
+    LEFT JOIN loading l ON l.entry_id = e.id
+    LEFT JOIN unloading u ON u.entry_id = e.id
+    WHERE substr(e.work_date,1,7) = ?`).get(month);
+
+  // QC per day (for MG floor)
+  const qcDaysRows = db.prepare(`SELECT q.parts_qty FROM qc q JOIN daily_entries e ON e.id=q.entry_id
+    WHERE substr(e.work_date,1,7) = ? AND q.parts_qty > 0`).all(month);
+  const qcActualQty = qcDaysRows.reduce((a, r) => a + r.parts_qty, 0);
+  const qcBilledQty = mgBilling ? qcDaysRows.reduce((a, r) => a + Math.max(r.parts_qty, mg), 0) : qcActualQty;
+  const qcMgUplift = qcBilledQty - qcActualQty;
+
+  const loadingRev = agg.load_parts * rates.loading.rate;
+  const unloadingRev = agg.unload_ton * rates.unloading.rate;
+  const qcRev = qcBilledQty * rates.qc.rate;
+  const serviceRev = loadingRev + unloadingRev + qcRev;
+
+  // Transport billing per trip
+  const trips = db.prepare(`SELECT from_loc, to_loc, vehicle_type FROM transport_trips t
+    JOIN daily_entries e ON e.id=t.entry_id WHERE substr(e.work_date,1,7) = ?`).all(month);
+  const routeMap = {};
+  let transportRev = 0, unknownTrips = 0;
+  for (const t of trips) {
+    const r = transportRate(t.from_loc, t.to_loc, t.vehicle_type);
+    const key = `${t.from_loc} → ${t.to_loc} (${t.vehicle_type})`;
+    routeMap[key] = routeMap[key] || { route: key, trips: 0, rate: r, amount: 0, known: r != null };
+    routeMap[key].trips++;
+    if (r != null) { routeMap[key].amount += r; transportRev += r; } else unknownTrips++;
+  }
+  const totalRev = serviceRev + transportRev;
+
+  // Costs / P&L
+  const transportCost = costs.transport_monthly && costs.transport_monthly > 0 ? costs.transport_monthly : transportRev;
+  const totalCost = (costs.manpower_monthly || 0) + (costs.overhead_monthly || 0) + transportCost;
+  const grossProfit = totalRev - totalCost;
+  const margin = totalRev ? grossProfit / totalRev : 0;
+
+  // Invoice
+  const subtotal = totalRev;
+  const gstPct = invoice.gst_pct || 0;
+  const gstAmt = Math.round(subtotal * gstPct) / 100;
+  const grandTotal = subtotal + gstAmt;
+
+  res.json({
+    month, rates, mg, mgBilling,
+    quantities: { load_parts: agg.load_parts, unload_ton: agg.unload_ton, qc_actual: qcActualQty, qc_billed: qcBilledQty, qc_mg_uplift: qcMgUplift },
+    revenue: { loading: loadingRev, unloading: unloadingRev, qc: qcRev, service: serviceRev, transport: transportRev, total: totalRev },
+    transport_routes: Object.values(routeMap), unknown_trips: unknownTrips,
+    pnl: { revenue: totalRev, manpower: costs.manpower_monthly || 0, overhead: costs.overhead_monthly || 0, transport: transportCost, total_cost: totalCost, gross_profit: grossProfit, margin },
+    invoice: { bill_to: invoice.bill_to, gstin: invoice.gstin || '', notes: invoice.notes || '', subtotal, gst_pct: gstPct, gst_amt: gstAmt, grand_total: grandTotal },
+  });
+});
+
+// ---- MIS (management dashboard aggregation) -------------------------------
+app.get('/api/mis', auth, (req, res) => {
+  const month = req.query.month || new Date().toISOString().slice(0, 7);
+  const days = db.prepare(`
+    SELECT e.work_date, e.status, e.ppm,
+      COALESCE(l.parts_qty,0) load_parts, COALESCE(l.truck_count,0) load_trucks, COALESCE(l.manpower_count,0) load_mp,
+      COALESCE(u.truck_count,0) unload_trucks, COALESCE(u.weight_ton,0) unload_ton,
+      COALESCE(q.parts_qty,0) qc_parts, COALESCE(q.manpower_count,0) qc_mp,
+      (SELECT COUNT(*) FROM transport_trips t WHERE t.entry_id = e.id) trips,
+      (SELECT COALESCE(SUM(actual_count),0) FROM manpower_actual m WHERE m.entry_id = e.id) mp_actual
+    FROM daily_entries e
+    LEFT JOIN loading l ON l.entry_id = e.id
+    LEFT JOIN unloading u ON u.entry_id = e.id
+    LEFT JOIN qc q ON q.entry_id = e.id
+    WHERE substr(e.work_date,1,7) = ? ORDER BY e.work_date`).all(month);
+
+  const approved = getSetting('approved_manpower', config.APPROVED_MANPOWER);
+  const approvedTotal = approved.reduce((a, x) => a + x.approved, 0);
+  const mgTarget = getSetting('mg', config.MG).qc_daily_parts;
+  const ppmTarget = getSetting('ppm_target', config.PPM_TARGET);
+  const ppmDays = days.filter(d => d.ppm != null);
+  const ppmAvg = ppmDays.length ? Math.round(ppmDays.reduce((a, d) => a + d.ppm, 0) / ppmDays.length) : null;
+
+  const mpCat = db.prepare(`SELECT category, COUNT(*) days, AVG(actual_count) avg_actual, SUM(actual_count) sum_actual
+    FROM manpower_actual m JOIN daily_entries e ON e.id = m.entry_id
+    WHERE substr(e.work_date,1,7) = ? GROUP BY category`).all(month);
+
+  const discByType = db.prepare(`SELECT type, COUNT(*) c, SUM(CASE WHEN status='OPEN' THEN 1 ELSE 0 END) open_c
+    FROM discrepancies WHERE substr(disc_date,1,7) = ? GROUP BY type`).all(month);
+  const discBySev = db.prepare(`SELECT severity, COUNT(*) c FROM discrepancies
+    WHERE substr(disc_date,1,7) = ? GROUP BY severity`).all(month);
+  const discTot = db.prepare(`SELECT COUNT(*) total, SUM(CASE WHEN status='OPEN' THEN 1 ELSE 0 END) open_c,
+    COALESCE(SUM(qty_dispatched),0) disp, COALESCE(SUM(qty_billed),0) bill,
+    COALESCE(SUM(COALESCE(qty_dispatched,0)-COALESCE(qty_billed,0)),0) variance
+    FROM discrepancies WHERE substr(disc_date,1,7) = ?`).get(month);
+
+  const trByVehicle = db.prepare(`SELECT vehicle_type, COUNT(*) c
+    FROM transport_trips t JOIN daily_entries e ON e.id = t.entry_id
+    WHERE substr(e.work_date,1,7) = ? GROUP BY vehicle_type ORDER BY c DESC`).all(month);
+  const trByRoute = db.prepare(`SELECT from_loc || ' → ' || to_loc route, vehicle_type, COUNT(*) c
+    FROM transport_trips t JOIN daily_entries e ON e.id = t.entry_id
+    WHERE substr(e.work_date,1,7) = ? GROUP BY from_loc, to_loc, vehicle_type ORDER BY c DESC`).all(month);
+
+  const mpReq = db.prepare(`SELECT status, COUNT(*) c, COALESCE(SUM(extra_count),0) extra
+    FROM manpower_requests WHERE substr(req_date,1,7) = ? GROUP BY status`).all(month);
+
+  const totals = days.reduce((t, d) => {
+    t.load_parts += d.load_parts; t.load_trucks += d.load_trucks;
+    t.unload_trucks += d.unload_trucks; t.unload_ton += d.unload_ton;
+    t.qc_parts += d.qc_parts; t.trips += d.trips; t.mp_actual += d.mp_actual;
+    if (d.qc_parts > 0 && d.qc_parts < mgTarget) t.mg_short_days++;
+    if (d.qc_parts >= mgTarget) t.mg_met_days++;
+    if (d.status === 'APPROVED') t.approved_days++;
+    return t;
+  }, { load_parts:0, load_trucks:0, unload_trucks:0, unload_ton:0, qc_parts:0, trips:0, mp_actual:0, mg_short_days:0, mg_met_days:0, approved_days:0 });
+
+  const opDays = days.length;
+  const qcDays = days.filter(d => d.qc_parts > 0).length;
+  const avgMpPerDay = opDays ? totals.mp_actual / opDays : 0;
+  const utilization = approvedTotal ? Math.round((avgMpPerDay / approvedTotal) * 100) : 0;
+  const mgAchievement = qcDays ? Math.round((totals.mg_met_days / qcDays) * 100) : 0;
+
+  res.json({ month, mgTarget, ppmTarget, ppmAvg, approved, approvedTotal, days, mpCat, discByType, discBySev, discTot,
+    trByVehicle, trByRoute, mpReq, totals, opDays, qcDays, avgMpPerDay, utilization, mgAchievement });
+});
+
+// ---- Admin: settings + users ---------------------------------------------
+app.put('/api/settings', auth, requireRole('ADMIN'), (req, res) => {
+  const b = req.body || {};
+  if (b.rates) setSetting('rates', b.rates);
+  if (b.mg) setSetting('mg', b.mg);
+  if (b.approvedManpower) setSetting('approved_manpower', b.approvedManpower);
+  if (typeof b.showBilling === 'boolean') setSetting('show_billing', b.showBilling);
+  if (b.costs) setSetting('costs', b.costs);
+  if (b.invoice) setSetting('invoice', b.invoice);
+  if (b.ppmTarget != null) setSetting('ppm_target', Number(b.ppmTarget));
+  if (typeof b.mgBilling === 'boolean') setSetting('mg_billing', b.mgBilling);
+  if (b.transportRates) setSetting('transport_rates', b.transportRates);
+  if (b.leavePolicy) setSetting('leave_policy', b.leavePolicy);
+  audit(req.user.id, 'SETTINGS_UPDATE');
+  res.json({ config: clientConfig() });
+});
+
+app.get('/api/users', auth, requireRole('ADMIN'), (req, res) => {
+  res.json({ users: db.prepare('SELECT id, name, username, role, company, active FROM users ORDER BY id').all() });
+});
+
+app.post('/api/users', auth, requireRole('ADMIN'), (req, res) => {
+  const { name, username, password, role, company } = req.body || {};
+  if (!name || !username || !password || !role || !company)
+    return res.status(400).json({ error: 'All fields required' });
+  if (!config.ROLES[role]) return res.status(400).json({ error: 'Invalid role' });
+  try {
+    db.prepare(`INSERT INTO users (name, username, password_hash, role, company) VALUES (?,?,?,?,?)`)
+      .run(name, username.trim(), bcrypt.hashSync(password, 10), role, company);
+    audit(req.user.id, 'USER_CREATE', { username });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(409).json({ error: 'Username already exists' });
+  }
+});
+
+app.post('/api/users/:id/toggle', auth, requireRole('ADMIN'), (req, res) => {
+  const u = db.prepare('SELECT * FROM users WHERE id=?').get(Number(req.params.id));
+  if (!u) return res.status(404).json({ error: 'Not found' });
+  db.prepare('UPDATE users SET active = CASE active WHEN 1 THEN 0 ELSE 1 END WHERE id=?').run(u.id);
+  res.json({ ok: true });
+});
+
+app.post('/api/users/:id/reset-password', auth, requireRole('ADMIN'), (req, res) => {
+  const { password } = req.body || {};
+  if (!password || password.length < 5) return res.status(400).json({ error: 'Password too short' });
+  db.prepare('UPDATE users SET password_hash=? WHERE id=?').run(bcrypt.hashSync(password, 10), Number(req.params.id));
+  res.json({ ok: true });
+});
+
+// ---- Workers (HR master) --------------------------------------------------
+const WORKER_FIELDS = ['roll_no','name','father_name','gender','dob','blood_group','mobile','address',
+  'aadhaar','pan','uan','esic_no','department','designation','date_of_joining','date_of_exit','supervisor',
+  'wage_type','monthly_gross','daily_wage','basic','hra','allowances','pf_applicable','esi_applicable',
+  'bank_holder','bank_name','account_no','ifsc','emergency_name','emergency_phone','emergency_relation','status'];
+const maskTail = (s, keep = 4) => { s = String(s || ''); return s ? '••••' + s.slice(-keep) : ''; };
+
+function workerDocs(id) {
+  return db.prepare(`SELECT d.id, d.doc_type, d.filename, d.caption, d.expiry_date, d.created_at, u.name uploaded_by_name
+    FROM worker_documents d LEFT JOIN users u ON u.id = d.uploaded_by WHERE d.worker_id = ? ORDER BY d.id`).all(id)
+    .map(d => ({ ...d, url: '/uploads/' + d.filename }));
+}
+
+app.get('/api/workers', auth, (req, res) => {
+  const { status, department, q } = req.query;
+  let sql = 'SELECT * FROM workers WHERE 1=1'; const args = [];
+  if (status) { sql += ' AND status = ?'; args.push(status); }
+  if (department) { sql += ' AND department = ?'; args.push(department); }
+  if (q) { sql += ' AND (name LIKE ? OR roll_no LIKE ? OR mobile LIKE ?)'; args.push(`%${q}%`, `%${q}%`, `%${q}%`); }
+  sql += ' ORDER BY CASE status WHEN \'ACTIVE\' THEN 0 ELSE 1 END, name LIMIT 1000';
+  const rows = db.prepare(sql).all(...args).map(w => ({
+    id: w.id, roll_no: w.roll_no, name: w.name, father_name: w.father_name, department: w.department,
+    designation: w.designation, mobile: w.mobile, status: w.status, date_of_joining: w.date_of_joining,
+    aadhaar_masked: maskTail(w.aadhaar), account_masked: maskTail(w.account_no),
+    wage_type: w.wage_type, monthly_gross: w.monthly_gross, daily_wage: w.daily_wage,
+    photo: w.photo ? '/uploads/' + w.photo : null,
+  }));
+  res.json({ workers: rows });
+});
+
+app.get('/api/workers/:id', auth, (req, res) => {
+  const w = db.prepare('SELECT * FROM workers WHERE id = ?').get(Number(req.params.id));
+  if (!w) return res.status(404).json({ error: 'Not found' });
+  // Full PII only for Drona management; others get masked.
+  const full = ['ADMIN', 'HQ', 'OPERATOR'].includes(req.user.role);
+  if (!full) { w.aadhaar = maskTail(w.aadhaar); w.account_no = maskTail(w.account_no); }
+  w.photo_url = w.photo ? '/uploads/' + w.photo : null;
+  w.documents = workerDocs(w.id);
+  res.json({ worker: w });
+});
+
+function collectWorker(b) {
+  const o = {};
+  for (const f of WORKER_FIELDS) {
+    if (!(f in b)) { o[f] = null; continue; }
+    if (['monthly_gross','daily_wage','basic','hra','allowances'].includes(f)) o[f] = Number(b[f]) || 0;
+    else if (['pf_applicable','esi_applicable'].includes(f)) o[f] = b[f] ? 1 : 0;
+    else o[f] = b[f] === '' ? null : b[f];
+  }
+  if (!o.status) o.status = 'ACTIVE';
+  if (!o.wage_type) o.wage_type = 'MONTHLY';
+  return o;
+}
+
+app.post('/api/workers', auth, requireRole('OPERATOR', 'ADMIN'), (req, res) => {
+  const b = req.body || {};
+  if (!b.name) return res.status(400).json({ error: 'Name is required' });
+  const o = collectWorker(b);
+  const cols = WORKER_FIELDS, ph = cols.map(() => '?').join(',');
+  try {
+    const info = db.prepare(`INSERT INTO workers (${cols.join(',')}) VALUES (${ph})`).run(...cols.map(c => o[c]));
+    audit(req.user.id, 'WORKER_CREATE', { id: info.lastInsertRowid });
+    res.json({ id: info.lastInsertRowid });
+  } catch (e) {
+    res.status(409).json({ error: /UNIQUE/.test(e.message) ? 'Roll no already exists' : e.message });
+  }
+});
+
+app.put('/api/workers/:id', auth, requireRole('OPERATOR', 'ADMIN'), (req, res) => {
+  const w = db.prepare('SELECT id FROM workers WHERE id = ?').get(Number(req.params.id));
+  if (!w) return res.status(404).json({ error: 'Not found' });
+  const o = collectWorker(req.body || {});
+  const set = WORKER_FIELDS.map(c => `${c}=?`).join(',');
+  try {
+    db.prepare(`UPDATE workers SET ${set}, updated_at=datetime('now') WHERE id=?`).run(...WORKER_FIELDS.map(c => o[c]), w.id);
+    audit(req.user.id, 'WORKER_UPDATE', { id: w.id });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(409).json({ error: /UNIQUE/.test(e.message) ? 'Roll no already exists' : e.message });
+  }
+});
+
+// Worker photo + documents (base64 image, client pre-resized)
+function saveImage(dataUrl, prefix) {
+  const m = /^data:image\/(png|jpeg|jpg|webp);base64,(.+)$/.exec(dataUrl || '');
+  if (!m) return null;
+  const ext = m[1] === 'jpeg' ? 'jpg' : m[1];
+  const buf = Buffer.from(m[2], 'base64');
+  if (buf.length > 6 * 1024 * 1024) return { error: 'Image too large' };
+  const filename = `${prefix}_${Date.now()}_${crypto.randomBytes(3).toString('hex')}.${ext}`;
+  fs.writeFileSync(path.join(UPLOAD_DIR, filename), buf);
+  return { filename };
+}
+
+app.post('/api/workers/:id/photo', auth, requireRole('OPERATOR', 'ADMIN'), (req, res) => {
+  const w = db.prepare('SELECT * FROM workers WHERE id=?').get(Number(req.params.id));
+  if (!w) return res.status(404).json({ error: 'Not found' });
+  const r = saveImage((req.body || {}).dataUrl, 'wphoto');
+  if (!r || r.error) return res.status(400).json({ error: r ? r.error : 'Invalid image' });
+  if (w.photo) { try { fs.unlinkSync(path.join(UPLOAD_DIR, w.photo)); } catch (_) {} }
+  db.prepare('UPDATE workers SET photo=? WHERE id=?').run(r.filename, w.id);
+  res.json({ url: '/uploads/' + r.filename });
+});
+
+app.post('/api/workers/:id/documents', auth, requireRole('OPERATOR', 'ADMIN'), (req, res) => {
+  const w = db.prepare('SELECT id FROM workers WHERE id=?').get(Number(req.params.id));
+  if (!w) return res.status(404).json({ error: 'Not found' });
+  const r = saveImage((req.body || {}).dataUrl, 'wdoc');
+  if (!r || r.error) return res.status(400).json({ error: r ? r.error : 'Invalid image' });
+  db.prepare('INSERT INTO worker_documents (worker_id, doc_type, filename, caption, expiry_date, uploaded_by) VALUES (?,?,?,?,?,?)')
+    .run(w.id, (req.body || {}).doc_type || 'Document', r.filename, (req.body || {}).caption || null, (req.body || {}).expiry_date || null, req.user.id);
+  res.json({ ok: true });
+});
+
+app.delete('/api/worker-documents/:id', auth, requireRole('OPERATOR', 'ADMIN'), (req, res) => {
+  const d = db.prepare('SELECT * FROM worker_documents WHERE id=?').get(Number(req.params.id));
+  if (!d) return res.status(404).json({ error: 'Not found' });
+  try { fs.unlinkSync(path.join(UPLOAD_DIR, d.filename)); } catch (_) {}
+  db.prepare('DELETE FROM worker_documents WHERE id=?').run(d.id);
+  res.json({ ok: true });
+});
+
+// ---- Attendance -----------------------------------------------------------
+app.get('/api/attendance', auth, (req, res) => {
+  const date = req.query.date || new Date().toISOString().slice(0, 10);
+  const dept = req.query.department;
+  let sql = `SELECT w.id worker_id, w.roll_no, w.name, w.department,
+      a.status, a.in_time, a.out_time, a.ot_hours, a.remarks
+    FROM workers w
+    LEFT JOIN attendance a ON a.worker_id = w.id AND a.work_date = ?
+    WHERE w.status = 'ACTIVE'`;
+  const args = [date];
+  if (dept) { sql += ' AND w.department = ?'; args.push(dept); }
+  sql += ' ORDER BY w.department, w.name';
+  res.json({ date, rows: db.prepare(sql).all(...args) });
+});
+
+app.post('/api/attendance', auth, requireRole('OPERATOR', 'ADMIN'), (req, res) => {
+  const { date, records } = req.body || {};
+  if (!date || !Array.isArray(records)) return res.status(400).json({ error: 'date and records required' });
+  const up = db.prepare(`INSERT INTO attendance (work_date, worker_id, status, in_time, out_time, ot_hours, remarks, marked_by)
+    VALUES (@date,@worker_id,@status,@in_time,@out_time,@ot_hours,@remarks,@marked_by)
+    ON CONFLICT(work_date, worker_id) DO UPDATE SET status=excluded.status, in_time=excluded.in_time,
+      out_time=excluded.out_time, ot_hours=excluded.ot_hours, remarks=excluded.remarks, marked_by=excluded.marked_by`);
+  const tx = db.transaction(() => {
+    for (const r of records) {
+      up.run({ date, worker_id: Number(r.worker_id), status: r.status || 'PRESENT',
+        in_time: r.in_time || null, out_time: r.out_time || null, ot_hours: Number(r.ot_hours) || 0,
+        remarks: r.remarks || null, marked_by: req.user.id });
+    }
+  });
+  tx();
+  audit(req.user.id, 'ATTENDANCE_SAVE', { date, count: records.length });
+  res.json({ ok: true, saved: records.length });
+});
+
+app.get('/api/attendance/register', auth, (req, res) => {
+  const month = req.query.month || new Date().toISOString().slice(0, 7);
+  const workers = db.prepare("SELECT id, roll_no, name, department FROM workers WHERE status='ACTIVE' ORDER BY department, name").all();
+  const recs = db.prepare(`SELECT worker_id, work_date, status, ot_hours FROM attendance WHERE substr(work_date,1,7)=?`).all(month);
+  const byWorker = {};
+  for (const r of recs) {
+    (byWorker[r.worker_id] = byWorker[r.worker_id] || {})[r.work_date.slice(8)] = { s: r.status, ot: r.ot_hours };
+  }
+  const present = (s) => s === 'PRESENT' ? 1 : s === 'HALF_DAY' ? 0.5 : 0;
+  const rows = workers.map(w => {
+    const days = byWorker[w.id] || {};
+    let p = 0, a = 0, l = 0, ot = 0;
+    Object.values(days).forEach(d => { p += present(d.s); if (d.s === 'ABSENT') a++; if (d.s === 'LEAVE') l++; ot += d.ot || 0; });
+    return { ...w, days, present_days: p, absent_days: a, leave_days: l, ot_hours: ot };
+  });
+  res.json({ month, workers: rows });
+});
+
+// ---- Leave management -----------------------------------------------------
+function daysInclusive(from, to) {
+  const a = new Date(from), b = new Date(to);
+  if (isNaN(a) || isNaN(b) || b < a) return 0;
+  return Math.round((b - a) / 86400000) + 1;
+}
+
+app.get('/api/leave', auth, (req, res) => {
+  const { status, worker_id, year } = req.query;
+  let sql = `SELECT l.*, w.name worker_name, w.roll_no, w.department,
+      ab.name applied_by_name, db_.name decided_by_name
+    FROM leave_applications l
+    JOIN workers w ON w.id = l.worker_id
+    LEFT JOIN users ab ON ab.id = l.applied_by
+    LEFT JOIN users db_ ON db_.id = l.decided_by WHERE 1=1`;
+  const args = [];
+  if (status) { sql += ' AND l.status = ?'; args.push(status); }
+  if (worker_id) { sql += ' AND l.worker_id = ?'; args.push(Number(worker_id)); }
+  if (year) { sql += ' AND substr(l.from_date,1,4) = ?'; args.push(String(year)); }
+  sql += ' ORDER BY l.status DESC, l.from_date DESC LIMIT 500';
+  res.json({ leaves: db.prepare(sql).all(...args) });
+});
+
+app.post('/api/leave', auth, requireRole('OPERATOR', 'ADMIN'), (req, res) => {
+  const b = req.body || {};
+  if (!b.worker_id || !b.leave_type || !b.from_date || !b.to_date)
+    return res.status(400).json({ error: 'worker, type, from and to dates are required' });
+  if (!config.LEAVE_TYPES.includes(b.leave_type)) return res.status(400).json({ error: 'Invalid leave type' });
+  const days = b.days != null && b.days !== '' ? Number(b.days) : daysInclusive(b.from_date, b.to_date);
+  if (days <= 0) return res.status(400).json({ error: 'Invalid date range' });
+  const info = db.prepare(`INSERT INTO leave_applications (worker_id, leave_type, from_date, to_date, days, reason, applied_by)
+    VALUES (?,?,?,?,?,?,?)`).run(Number(b.worker_id), b.leave_type, b.from_date, b.to_date, days, b.reason || null, req.user.id);
+  audit(req.user.id, 'LEAVE_APPLY', { id: info.lastInsertRowid });
+  res.json({ id: info.lastInsertRowid });
+});
+
+app.post('/api/leave/:id/decision', auth, requireRole('HQ', 'ADMIN'), (req, res) => {
+  const { decision, remarks } = req.body || {};
+  const l = db.prepare('SELECT * FROM leave_applications WHERE id = ?').get(Number(req.params.id));
+  if (!l) return res.status(404).json({ error: 'Not found' });
+  if (l.status !== 'PENDING') return res.status(409).json({ error: 'Already decided' });
+  if (!['APPROVE', 'REJECT'].includes(decision)) return res.status(400).json({ error: 'Invalid decision' });
+  const status = decision === 'APPROVE' ? 'APPROVED' : 'REJECTED';
+  db.prepare(`UPDATE leave_applications SET status=?, decided_by=?, decided_at=datetime('now'), decision_remarks=? WHERE id=?`)
+    .run(status, req.user.id, remarks || null, l.id);
+  audit(req.user.id, 'LEAVE_' + status, { id: l.id });
+  res.json({ ok: true });
+});
+
+app.get('/api/leave/balances', auth, (req, res) => {
+  const year = req.query.year || String(new Date().getFullYear());
+  const policy = getSetting('leave_policy', config.LEAVE_POLICY);
+  const workers = req.query.worker_id
+    ? db.prepare("SELECT id, roll_no, name, department FROM workers WHERE id = ?").all(Number(req.query.worker_id))
+    : db.prepare("SELECT id, roll_no, name, department FROM workers WHERE status='ACTIVE' ORDER BY name").all();
+  const taken = db.prepare(`SELECT worker_id, leave_type, COALESCE(SUM(days),0) d
+    FROM leave_applications WHERE status='APPROVED' AND substr(from_date,1,4)=? GROUP BY worker_id, leave_type`).all(year);
+  const takenMap = {};
+  taken.forEach(t => { (takenMap[t.worker_id] = takenMap[t.worker_id] || {})[t.leave_type] = t.d; });
+  const rows = workers.map(w => {
+    const byType = config.LEAVE_TYPES.map(t => {
+      const ent = policy[t] || 0, used = (takenMap[w.id] || {})[t] || 0;
+      return { type: t, entitlement: ent, taken: used, balance: ent - used };
+    });
+    return { ...w, byType };
+  });
+  res.json({ year, policy, types: config.LEAVE_TYPES, workers: rows });
+});
+
+// ---- Compliance: wage register --------------------------------------------
+app.get('/api/compliance/wage-register', auth, requireRole('ADMIN', 'HQ'), (req, res) => {
+  const month = req.query.month || new Date().toISOString().slice(0, 7);
+  const stdDays = config.WORKING_DAYS_PER_MONTH || 26;
+  const workers = db.prepare("SELECT * FROM workers WHERE status='ACTIVE' ORDER BY department, name").all();
+  const att = db.prepare(`SELECT worker_id, status, ot_hours FROM attendance WHERE substr(work_date,1,7)=?`).all(month);
+  const byW = {};
+  att.forEach(a => { const m = byW[a.worker_id] = byW[a.worker_id] || { p: 0, ot: 0 };
+    m.p += a.status === 'PRESENT' ? 1 : a.status === 'HALF_DAY' ? 0.5 : 0; m.ot += a.ot_hours || 0; });
+  let tot = { present: 0, gross: 0, ot: 0, pf: 0, esi: 0, net: 0 };
+  const rows = workers.map(w => {
+    const m = byW[w.id] || { p: 0, ot: 0 };
+    const perDay = w.wage_type === 'DAILY' ? (w.daily_wage || 0) : ((w.monthly_gross || 0) / stdDays);
+    const earnedGross = Math.round(perDay * m.p);
+    const hourly = perDay / 8;
+    const otPay = Math.round(m.ot * hourly * 2); // 2x overtime
+    const basicEarned = w.wage_type === 'DAILY' ? earnedGross : Math.round((w.basic || 0) / stdDays * m.p);
+    const pf = w.pf_applicable ? Math.round(basicEarned * 0.12) : 0;
+    const esi = (w.esi_applicable && (earnedGross + otPay) <= 21000) ? Math.round((earnedGross + otPay) * 0.0075) : 0;
+    const net = earnedGross + otPay - pf - esi;
+    tot.present += m.p; tot.gross += earnedGross; tot.ot += otPay; tot.pf += pf; tot.esi += esi; tot.net += net;
+    return { id: w.id, roll_no: w.roll_no, name: w.name, department: w.department, wage_type: w.wage_type,
+      present_days: m.p, ot_hours: m.ot, gross: earnedGross, ot_pay: otPay, pf, esi, net };
+  });
+  res.json({ month, std_days: stdDays, rows, totals: tot });
+});
+
+// ---- Compliance: document expiry ------------------------------------------
+app.get('/api/compliance/document-expiry', auth, (req, res) => {
+  const days = Number(req.query.days || 45);
+  const rows = db.prepare(`SELECT d.id, d.doc_type, d.expiry_date, d.filename, w.id worker_id, w.name worker_name, w.roll_no, w.department
+    FROM worker_documents d JOIN workers w ON w.id = d.worker_id
+    WHERE d.expiry_date IS NOT NULL AND d.expiry_date <= date('now', '+' || ? || ' days')
+    ORDER BY d.expiry_date`).all(days)
+    .map(r => ({ ...r, url: '/uploads/' + r.filename,
+      expired: r.expiry_date < new Date().toISOString().slice(0,10) }));
+  res.json({ within_days: days, documents: rows });
+});
+
+// ---- Static frontend ------------------------------------------------------
+app.use(express.static(path.join(__dirname, 'public')));
+app.get('*', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
+
+app.listen(PORT, () => {
+  console.log(`\n  Drona ValueChain — JMC Ops Tracker`);
+  console.log(`  Running at http://localhost:${PORT}\n`);
+});
