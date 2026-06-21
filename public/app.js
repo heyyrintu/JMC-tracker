@@ -70,11 +70,11 @@ function renderLogin(errMsg) {
     <div class="field"><label>Username</label><input name="username" autocomplete="username" autofocus required></div>
     <div class="field"><label>Password</label><input name="password" type="password" autocomplete="current-password" required></div>
     <button class="btn primary" style="width:100%" type="submit">Sign in</button>
-    <div class="demo"><b>Demo logins</b><br>
+    ${State.cfg.demo ? `<div class="demo"><b>Demo logins</b><br>
       Admin <code>admin / admin123</code><br>
       Operator <code>operator / oper123</code><br>
       HQ <code>hq / hq123</code><br>
-      JMC <code>jmc / jmc123</code></div>
+      JMC <code>jmc / jmc123</code></div>` : ''}
   </form></div>`);
   $('#root').appendChild(card);
   $('#loginForm').addEventListener('submit', async (e) => {

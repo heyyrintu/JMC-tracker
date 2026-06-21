@@ -16,14 +16,45 @@ seed();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const IS_PROD = process.env.NODE_ENV === 'production';
+const SESSION_HOURS = 12;
+
+// Trust the first proxy hop (nginx/caddy in the documented deploy) so req.ip
+// reflects the real client for rate limiting, and Secure cookies work over TLS.
+app.set('trust proxy', 1);
 
 // Folder for uploaded proof photos.
 const UPLOAD_DIR = process.env.UPLOAD_DIR || path.join(__dirname, 'uploads');
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
+// Security headers on every response. CSP allows our own scripts only (blocks
+// injected external scripts), with inline styles + Google Fonts permitted
+// because the SPA renders many inline style attributes.
+const CSP = [
+  "default-src 'self'",
+  "base-uri 'self'",
+  "object-src 'none'",
+  "frame-ancestors 'none'",
+  "img-src 'self' data: blob:",
+  "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+  "font-src 'self' https://fonts.gstatic.com",
+  "script-src 'self'",
+  "connect-src 'self'",
+].join('; ');
+app.use((req, res, next) => {
+  res.setHeader('Content-Security-Policy', CSP);
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'same-origin');
+  next();
+});
+
 app.use(express.json({ limit: '12mb' })); // room for base64 photos (client pre-resizes)
 app.use(cookieParser());
-app.use('/uploads', express.static(UPLOAD_DIR));
+// Uploaded files are user-supplied bytes — force download-safe content typing.
+app.use('/uploads', express.static(UPLOAD_DIR, {
+  setHeaders: (res) => res.setHeader('X-Content-Type-Options', 'nosniff'),
+}));
 
 // ---- Helpers --------------------------------------------------------------
 function audit(userId, action, detail) {
@@ -38,9 +69,19 @@ function publicUser(u) {
 function currentUser(req) {
   const token = req.cookies.sid;
   if (!token) return null;
+  // Sessions expire server-side after SESSION_HOURS — a stolen token can't live
+  // forever, and the client-side cookie maxAge alone is not trustworthy.
   const row = db.prepare(`SELECT u.* FROM sessions s JOIN users u ON u.id = s.user_id
-                          WHERE s.token = ? AND u.active = 1`).get(token);
+                          WHERE s.token = ? AND u.active = 1
+                            AND s.created_at > datetime('now', ?)`)
+    .get(token, `-${SESSION_HOURS} hours`);
   return row || null;
+}
+function pruneSessions() {
+  try {
+    db.prepare(`DELETE FROM sessions WHERE created_at <= datetime('now', ?)`)
+      .run(`-${SESSION_HOURS} hours`);
+  } catch (_) {}
 }
 function auth(req, res, next) {
   const u = currentUser(req);
@@ -57,14 +98,39 @@ function requireRole(...roles) {
 }
 
 // ---- Auth -----------------------------------------------------------------
+const SESSION_COOKIE = { httpOnly: true, sameSite: 'lax', secure: IS_PROD, maxAge: 1000 * 60 * 60 * SESSION_HOURS };
+
+// A real bcrypt hash to compare against when the username is unknown, so the
+// response time doesn't reveal whether an account exists (anti-enumeration).
+const DUMMY_HASH = bcrypt.hashSync('unused-placeholder-password', 10);
+
+// In-memory login throttle (per client IP). Zero-dependency; resets on restart.
+const LOGIN_WINDOW_MS = 15 * 60 * 1000, LOGIN_MAX = 10;
+const loginHits = new Map();
+function loginThrottle(ip) {
+  const now = Date.now();
+  const rec = loginHits.get(ip);
+  if (!rec || now - rec.first > LOGIN_WINDOW_MS) { loginHits.set(ip, { first: now, count: 1 }); return true; }
+  rec.count++;
+  return rec.count <= LOGIN_MAX;
+}
+function loginReset(ip) { loginHits.delete(ip); }
+
 app.post('/api/login', (req, res) => {
+  const ip = req.ip || 'unknown';
+  if (!loginThrottle(ip))
+    return res.status(429).json({ error: 'Too many login attempts — try again later' });
   const { username, password } = req.body || {};
   const u = db.prepare('SELECT * FROM users WHERE username = ? AND active = 1').get((username || '').trim());
-  if (!u || !bcrypt.compareSync(password || '', u.password_hash))
+  // Always run a bcrypt comparison (real or dummy) for constant-ish timing.
+  const ok = bcrypt.compareSync(password || '', u ? u.password_hash : DUMMY_HASH);
+  if (!u || !ok)
     return res.status(401).json({ error: 'Invalid username or password' });
+  loginReset(ip);
+  pruneSessions();
   const token = crypto.randomBytes(24).toString('hex');
   db.prepare('INSERT INTO sessions (token, user_id) VALUES (?, ?)').run(token, u.id);
-  res.cookie('sid', token, { httpOnly: true, sameSite: 'lax', maxAge: 1000 * 60 * 60 * 12 });
+  res.cookie('sid', token, SESSION_COOKIE);
   audit(u.id, 'LOGIN');
   res.json({ user: publicUser(u) });
 });
@@ -97,6 +163,7 @@ function clientConfig() {
     mgBilling: !!getSetting('mg_billing', config.MG_BILLING),
     leaveTypes: config.LEAVE_TYPES,
     leavePolicy: getSetting('leave_policy', config.LEAVE_POLICY),
+    demo: !IS_PROD, // gate the on-screen demo-credentials hint
   };
 }
 
@@ -578,6 +645,11 @@ app.post('/api/users', auth, requireRole('ADMIN'), (req, res) => {
 app.post('/api/users/:id/toggle', auth, requireRole('ADMIN'), (req, res) => {
   const u = db.prepare('SELECT * FROM users WHERE id=?').get(Number(req.params.id));
   if (!u) return res.status(404).json({ error: 'Not found' });
+  // Don't let the last active admin be deactivated — that would lock everyone out of Admin.
+  if (u.role === 'ADMIN' && u.active === 1) {
+    const activeAdmins = db.prepare("SELECT COUNT(*) c FROM users WHERE role='ADMIN' AND active=1").get().c;
+    if (activeAdmins <= 1) return res.status(409).json({ error: 'Cannot deactivate the last active admin' });
+  }
   db.prepare('UPDATE users SET active = CASE active WHEN 1 THEN 0 ELSE 1 END WHERE id=?').run(u.id);
   res.json({ ok: true });
 });
@@ -595,6 +667,10 @@ const WORKER_FIELDS = ['roll_no','name','father_name','gender','dob','blood_grou
   'wage_type','monthly_gross','daily_wage','basic','hra','allowances','pf_applicable','esi_applicable',
   'bank_holder','bank_name','account_no','ifsc','emergency_name','emergency_phone','emergency_relation','status'];
 const maskTail = (s, keep = 4) => { s = String(s || ''); return s ? '••••' + s.slice(-keep) : ''; };
+// Roles allowed to see Drona's HR/worker data at all (the JMC client is excluded).
+const DRONA_HR = ['OPERATOR', 'HQ', 'ADMIN'];
+// Identifier fields masked for any role that isn't full-PII management.
+const MASK_FIELDS = ['aadhaar', 'pan', 'uan', 'esic_no', 'account_no', 'ifsc'];
 
 function workerDocs(id) {
   return db.prepare(`SELECT d.id, d.doc_type, d.filename, d.caption, d.expiry_date, d.created_at, u.name uploaded_by_name
@@ -602,7 +678,7 @@ function workerDocs(id) {
     .map(d => ({ ...d, url: '/uploads/' + d.filename }));
 }
 
-app.get('/api/workers', auth, (req, res) => {
+app.get('/api/workers', auth, requireRole(...DRONA_HR), (req, res) => {
   const { status, department, q } = req.query;
   let sql = 'SELECT * FROM workers WHERE 1=1'; const args = [];
   if (status) { sql += ' AND status = ?'; args.push(status); }
@@ -619,12 +695,12 @@ app.get('/api/workers', auth, (req, res) => {
   res.json({ workers: rows });
 });
 
-app.get('/api/workers/:id', auth, (req, res) => {
+app.get('/api/workers/:id', auth, requireRole(...DRONA_HR), (req, res) => {
   const w = db.prepare('SELECT * FROM workers WHERE id = ?').get(Number(req.params.id));
   if (!w) return res.status(404).json({ error: 'Not found' });
-  // Full PII only for Drona management; others get masked.
+  // Full PII only for Drona management; any other role gets all identifiers masked.
   const full = ['ADMIN', 'HQ', 'OPERATOR'].includes(req.user.role);
-  if (!full) { w.aadhaar = maskTail(w.aadhaar); w.account_no = maskTail(w.account_no); }
+  if (!full) MASK_FIELDS.forEach(f => { w[f] = maskTail(w[f]); });
   w.photo_url = w.photo ? '/uploads/' + w.photo : null;
   w.documents = workerDocs(w.id);
   res.json({ worker: w });
@@ -653,7 +729,9 @@ app.post('/api/workers', auth, requireRole('OPERATOR', 'ADMIN'), (req, res) => {
     audit(req.user.id, 'WORKER_CREATE', { id: info.lastInsertRowid });
     res.json({ id: info.lastInsertRowid });
   } catch (e) {
-    res.status(409).json({ error: /UNIQUE/.test(e.message) ? 'Roll no already exists' : e.message });
+    if (/UNIQUE/.test(e.message)) return res.status(409).json({ error: 'Roll no already exists' });
+    console.error('Worker save error:', e);
+    return res.status(500).json({ error: 'Could not save worker' });
   }
 });
 
@@ -667,7 +745,9 @@ app.put('/api/workers/:id', auth, requireRole('OPERATOR', 'ADMIN'), (req, res) =
     audit(req.user.id, 'WORKER_UPDATE', { id: w.id });
     res.json({ ok: true });
   } catch (e) {
-    res.status(409).json({ error: /UNIQUE/.test(e.message) ? 'Roll no already exists' : e.message });
+    if (/UNIQUE/.test(e.message)) return res.status(409).json({ error: 'Roll no already exists' });
+    console.error('Worker save error:', e);
+    return res.status(500).json({ error: 'Could not save worker' });
   }
 });
 
@@ -712,7 +792,7 @@ app.delete('/api/worker-documents/:id', auth, requireRole('OPERATOR', 'ADMIN'), 
 });
 
 // ---- Attendance -----------------------------------------------------------
-app.get('/api/attendance', auth, (req, res) => {
+app.get('/api/attendance', auth, requireRole(...DRONA_HR), (req, res) => {
   const date = req.query.date || new Date().toISOString().slice(0, 10);
   const dept = req.query.department;
   let sql = `SELECT w.id worker_id, w.roll_no, w.name, w.department,
@@ -745,7 +825,7 @@ app.post('/api/attendance', auth, requireRole('OPERATOR', 'ADMIN'), (req, res) =
   res.json({ ok: true, saved: records.length });
 });
 
-app.get('/api/attendance/register', auth, (req, res) => {
+app.get('/api/attendance/register', auth, requireRole(...DRONA_HR), (req, res) => {
   const month = req.query.month || new Date().toISOString().slice(0, 7);
   const workers = db.prepare("SELECT id, roll_no, name, department FROM workers WHERE status='ACTIVE' ORDER BY department, name").all();
   const recs = db.prepare(`SELECT worker_id, work_date, status, ot_hours FROM attendance WHERE substr(work_date,1,7)=?`).all(month);
@@ -770,7 +850,7 @@ function daysInclusive(from, to) {
   return Math.round((b - a) / 86400000) + 1;
 }
 
-app.get('/api/leave', auth, (req, res) => {
+app.get('/api/leave', auth, requireRole(...DRONA_HR), (req, res) => {
   const { status, worker_id, year } = req.query;
   let sql = `SELECT l.*, w.name worker_name, w.roll_no, w.department,
       ab.name applied_by_name, db_.name decided_by_name
@@ -812,7 +892,7 @@ app.post('/api/leave/:id/decision', auth, requireRole('HQ', 'ADMIN'), (req, res)
   res.json({ ok: true });
 });
 
-app.get('/api/leave/balances', auth, (req, res) => {
+app.get('/api/leave/balances', auth, requireRole(...DRONA_HR), (req, res) => {
   const year = req.query.year || String(new Date().getFullYear());
   const policy = getSetting('leave_policy', config.LEAVE_POLICY);
   const workers = req.query.worker_id
@@ -860,7 +940,7 @@ app.get('/api/compliance/wage-register', auth, requireRole('ADMIN', 'HQ'), (req,
 });
 
 // ---- Compliance: document expiry ------------------------------------------
-app.get('/api/compliance/document-expiry', auth, (req, res) => {
+app.get('/api/compliance/document-expiry', auth, requireRole(...DRONA_HR), (req, res) => {
   const days = Number(req.query.days || 45);
   const rows = db.prepare(`SELECT d.id, d.doc_type, d.expiry_date, d.filename, w.id worker_id, w.name worker_name, w.roll_no, w.department
     FROM worker_documents d JOIN workers w ON w.id = d.worker_id
