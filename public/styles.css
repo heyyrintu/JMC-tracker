@@ -271,6 +271,16 @@ input[type=month],input[type=date],input[type=number]{font-family:var(--font-mon
 .trip-row{display:grid;grid-template-columns:1fr 1fr 1fr .7fr 1.2fr auto;gap:8px;align-items:end;margin-bottom:8px}
 @media(max-width:760px){.trip-row{grid-template-columns:1fr 1fr}}
 
+/* Modal (change password, etc.) */
+.modal-backdrop{position:fixed;inset:0;z-index:90;background:rgba(8,16,34,.55);
+  display:flex;align-items:center;justify-content:center;padding:20px;
+  animation:toastIn .18s ease both}
+.modal{background:var(--card);border:1px solid var(--line);border-radius:16px;
+  box-shadow:var(--shadow-lg);width:380px;max-width:94vw;padding:24px;position:relative;
+  border-top:3px solid transparent;animation:rise .26s cubic-bezier(.2,.7,.2,1) both}
+.modal::before{content:"";position:absolute;top:-3px;left:0;right:0;height:3px;border-radius:16px 16px 0 0;background:var(--signal)}
+.modal h3{margin-bottom:14px}
+
 /* ===========================================================================
    Entrance motion — staggered reveal per page render
    =========================================================================== */

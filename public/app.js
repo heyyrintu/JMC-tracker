@@ -32,7 +32,7 @@ const ROLE_NAV = {
   OPERATOR:     ['dashboard','entry','workers','attendance','leave','compliance','discrepancies','requests','reports','mis'],
   JMC_APPROVER: ['dashboard','approvals','discrepancies','reports','mis'],
   HQ:           ['dashboard','workers','attendance','leave','compliance','discrepancies','requests','reports','mis','billing'],
-  ADMIN:        ['dashboard','entry','workers','attendance','leave','compliance','approvals','discrepancies','requests','reports','mis','billing','settings','users'],
+  ADMIN:        ['dashboard','entry','workers','attendance','leave','compliance','approvals','discrepancies','requests','reports','mis','billing','settings','users','audit'],
 };
 const NAV_META = {
   dashboard:{ic:'▤',label:'Dashboard'}, entry:{ic:'✎',label:'Daily Entry'},
@@ -42,6 +42,7 @@ const NAV_META = {
   requests:{ic:'＋',label:'Manpower Requests'},
   reports:{ic:'▦',label:'Reports'}, mis:{ic:'▣',label:'MIS Dashboard'}, billing:{ic:'₹',label:'Billing'},
   settings:{ic:'⚙',label:'Settings'}, users:{ic:'◐',label:'Users'},
+  audit:{ic:'🗒',label:'Audit Log'},
 };
 const DEPARTMENTS = () => (State.cfg.approvedManpower||[]).map(c=>c.category).concat('OTHER');
 const inr = (n) => '₹' + fmt(Math.round(+n || 0));
@@ -52,10 +53,19 @@ const DISC_TYPES = {
 
 // ---- boot -----------------------------------------------------------------
 (async function boot() {
-  const me = await api('/me');
-  State.cfg = me.config;
-  if (me.user) { State.user = me.user; renderApp(); }
-  else renderLogin();
+  try {
+    const me = await api('/me');
+    State.cfg = me.config;
+    if (me.user) { State.user = me.user; renderApp(); }
+    else renderLogin();
+  } catch (err) {
+    $('#root').innerHTML = '';
+    const box = h(`<div style="max-width:420px;margin:18vh auto;text-align:center">
+      <h2>Can't reach the server</h2><p class="muted">${esc(err.message)}</p>
+      <button class="btn primary" id="bootRetry">Retry</button></div>`);
+    $('#root').appendChild(box);
+    box.querySelector('#bootRetry').addEventListener('click', () => location.reload());
+  }
 })();
 
 // ---- login ----------------------------------------------------------------
@@ -97,7 +107,8 @@ function renderApp() {
       <div class="brand"><img class="brandlogo" src="/logo.svg" alt="Drona Valuechain"><div class="bt"><b>Drona Valuechain</b><span>JMC Operations Tracker</span></div></div>
       <nav id="nav"></nav>
       <div class="who"><b>${esc(State.user.name)}</b>${esc(State.user.roleLabel)} · ${esc(State.user.company)}
-        <div style="margin-top:8px"><a id="logout" style="color:#9fc3df;cursor:pointer">Sign out →</a></div></div>
+        <div style="margin-top:8px"><a id="chgpw" style="color:#9fc3df;cursor:pointer">Change password</a>
+          <a id="logout" style="color:#9fc3df;cursor:pointer;margin-left:12px">Sign out →</a></div></div>
     </aside>
     <main class="main" id="view"></main>
   </div>`);
@@ -110,6 +121,7 @@ function renderApp() {
     navEl.appendChild(a);
   });
   $('#logout').addEventListener('click', async () => { await api('/logout', { method: 'POST' }); location.reload(); });
+  $('#chgpw').addEventListener('click', passwordModal);
   ROUTES[State.route]();
   refreshBadges();
 }
@@ -174,6 +186,33 @@ async function scanQR(targetInput) {
 
 function topbar(title, sub) {
   return `<div class="topbar"><div class="crumbs"><h2>${esc(title)}</h2><p>${esc(sub||'')}</p></div></div>`;
+}
+
+// Self-service password change — lightweight modal (no native prompt()).
+function passwordModal() {
+  const ov = h(`<div class="modal-backdrop"><div class="modal">
+    <h3>Change password</h3>
+    <div class="field"><label>Current password</label><input type="password" id="pwCur" autocomplete="current-password"></div>
+    <div class="field"><label>New password <span class="muted small">(min 5 chars)</span></label><input type="password" id="pwNew" autocomplete="new-password"></div>
+    <div class="field"><label>Confirm new password</label><input type="password" id="pwNew2" autocomplete="new-password"></div>
+    <div class="btn-row" style="justify-content:flex-end;margin-top:4px">
+      <button class="btn ghost" id="pwCancel">Cancel</button>
+      <button class="btn primary" id="pwSave">Update password</button></div>
+  </div></div>`);
+  document.body.appendChild(ov);
+  const close = () => ov.remove();
+  ov.querySelector('#pwCancel').addEventListener('click', close);
+  ov.addEventListener('click', (e) => { if (e.target === ov) close(); });
+  ov.querySelector('#pwCur').focus();
+  ov.querySelector('#pwSave').addEventListener('click', async () => {
+    const cur = $('#pwCur').value, nw = $('#pwNew').value, nw2 = $('#pwNew2').value;
+    if (nw.length < 5) { toast('New password must be at least 5 characters', 'bad'); return; }
+    if (nw !== nw2) { toast('New passwords do not match', 'bad'); return; }
+    try {
+      await api('/me/password', { method: 'POST', body: { current: cur, password: nw } });
+      toast('Password updated', 'ok'); close();
+    } catch (e) { toast(e.message, 'bad'); }
+  });
 }
 
 // ===========================================================================
@@ -707,6 +746,26 @@ ROUTES.users = async function () {
       catch(e){ toast(e.message,'bad'); }
     }));
   }
+};
+
+// ===========================================================================
+// AUDIT LOG (Admin)
+// ===========================================================================
+ROUTES.audit = async function () {
+  const v = $('#view');
+  v.innerHTML = topbar('Audit Log', 'Recent actions across the system (most recent first).') +
+    `<div id="auBody"><div class="empty">Loading…</div></div>`;
+  try {
+    const r = await api('/audit?limit=300');
+    if (!r.entries.length) { $('#auBody').innerHTML = `<div class="card empty">No activity logged yet.</div>`; return; }
+    const rows = r.entries.map(e => `<tr>
+      <td class="small muted">${esc((e.at||'').replace('T',' '))}</td>
+      <td>${esc(e.user_name||'—')}<div class="small muted">${esc(e.username||'')}</div></td>
+      <td><span class="tag">${esc(e.action)}</span></td>
+      <td class="small muted">${esc(e.detail||'')}</td></tr>`).join('');
+    $('#auBody').innerHTML = `<div class="card"><table><thead><tr><th>When</th><th>User</th><th>Action</th><th>Detail</th></tr></thead><tbody>${rows}</tbody></table>
+      <p class="small muted" style="margin-top:8px">Showing the latest ${r.entries.length} events.</p></div>`;
+  } catch (e) { $('#auBody').innerHTML = `<div class="card empty">${esc(e.message)}</div>`; }
 };
 
 // ===========================================================================

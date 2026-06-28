@@ -10,6 +10,7 @@ const cookieParser = require('cookie-parser');
 const bcrypt = require('bcryptjs');
 const { db, getSetting, setSetting, seed } = require('./db');
 const config = require('./config');
+const calc = require('./calc');
 
 // Ensure defaults exist on boot.
 seed();
@@ -51,10 +52,19 @@ app.use((req, res, next) => {
 
 app.use(express.json({ limit: '12mb' })); // room for base64 photos (client pre-resizes)
 app.use(cookieParser());
-// Uploaded files are user-supplied bytes — force download-safe content typing.
-app.use('/uploads', express.static(UPLOAD_DIR, {
-  setHeaders: (res) => res.setHeader('X-Content-Type-Options', 'nosniff'),
-}));
+// Uploaded files contain operational proof photos AND worker PII (ID / bank
+// documents). They must never be world-readable: require a valid session, and
+// restrict worker photos/documents (wphoto_ / wdoc_ prefixes) to Drona HR roles
+// so the JMC client can only ever load daily-entry attachment photos.
+app.get('/uploads/:file', auth, (req, res) => {
+  const file = path.basename(String(req.params.file || '')); // strip any traversal
+  const full = path.join(UPLOAD_DIR, file);
+  if (path.dirname(full) !== UPLOAD_DIR) return res.status(400).json({ error: 'Bad path' });
+  if (/^w(doc|photo)_/.test(file) && !DRONA_HR.includes(req.user.role))
+    return res.status(403).json({ error: 'Not permitted' });
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.sendFile(full, (err) => { if (err && !res.headersSent) res.status(404).json({ error: 'Not found' }); });
+});
 
 // ---- Helpers --------------------------------------------------------------
 function audit(userId, action, detail) {
@@ -141,13 +151,28 @@ app.post('/api/logout', auth, (req, res) => {
   res.json({ ok: true });
 });
 
-app.get('/api/me', (req, res) => {
-  const u = currentUser(req);
-  res.json({ user: publicUser(u), config: clientConfig() });
+// Self-service password change. Verifies the current password, then rotates the
+// hash and revokes the user's *other* sessions (keeps the caller signed in).
+app.post('/api/me/password', auth, (req, res) => {
+  const { current, password } = req.body || {};
+  if (!password || password.length < 5)
+    return res.status(400).json({ error: 'New password must be at least 5 characters' });
+  const u = db.prepare('SELECT password_hash FROM users WHERE id = ?').get(req.user.id);
+  if (!u || !bcrypt.compareSync(current || '', u.password_hash))
+    return res.status(401).json({ error: 'Current password is incorrect' });
+  db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(bcrypt.hashSync(password, 10), req.user.id);
+  db.prepare('DELETE FROM sessions WHERE user_id = ? AND token <> ?').run(req.user.id, req.cookies.sid);
+  audit(req.user.id, 'PASSWORD_CHANGE');
+  res.json({ ok: true });
 });
 
-function clientConfig() {
-  return {
+app.get('/api/me', (req, res) => {
+  const u = currentUser(req);
+  res.json({ user: publicUser(u), config: clientConfig(u) });
+});
+
+function clientConfig(user) {
+  const cfg = {
     company: config.COMPANY,
     roles: config.ROLES,
     showBilling: !!getSetting('show_billing', false),
@@ -158,13 +183,19 @@ function clientConfig() {
     locations: config.COMMON_LOCATIONS,
     workingDays: config.WORKING_DAYS_PER_MONTH,
     ppmTarget: getSetting('ppm_target', config.PPM_TARGET),
-    invoice: getSetting('invoice', config.INVOICE),
-    costs: getSetting('costs', config.COSTS),
     mgBilling: !!getSetting('mg_billing', config.MG_BILLING),
     leaveTypes: config.LEAVE_TYPES,
     leavePolicy: getSetting('leave_policy', config.LEAVE_POLICY),
     demo: !IS_PROD, // gate the on-screen demo-credentials hint
   };
+  // Internal financials — monthly costs and invoice/GST details — are Drona
+  // management only. Never ship them to the JMC client or floor operators
+  // (the Settings screen that consumes them is ADMIN-only anyway).
+  if (user && (user.role === 'ADMIN' || user.role === 'HQ')) {
+    cfg.costs = getSetting('costs', config.COSTS);
+    cfg.invoice = getSetting('invoice', config.INVOICE);
+  }
+  return cfg;
 }
 
 // Resolve a transport trip's rate from the configured route table.
@@ -287,7 +318,11 @@ app.post('/api/entries', auth, requireRole('OPERATOR', 'ADMIN'), (req, res) => {
                              VALUES (?,?,?,?,?,?)`);
     for (const t of (b.transport || [])) {
       if (!t.from_loc || !t.to_loc || !t.vehicle_type) continue;
-      tIns.run(entryId, t.from_loc, t.to_loc, t.vehicle_type, t.trip_time || null, t.remarks || null);
+      // Normalise locations (trim + upper) so free-text entries still match the
+      // configured route-rate table, which is keyed on uppercase location names.
+      const from = String(t.from_loc).trim().toUpperCase();
+      const to = String(t.to_loc).trim().toUpperCase();
+      tIns.run(entryId, from, to, t.vehicle_type, t.trip_time || null, t.remarks || null);
     }
 
     if (b.submit) {
@@ -495,9 +530,8 @@ app.get('/api/billing', auth, requireRole('ADMIN', 'HQ'), (req, res) => {
   // QC per day (for MG floor)
   const qcDaysRows = db.prepare(`SELECT q.parts_qty FROM qc q JOIN daily_entries e ON e.id=q.entry_id
     WHERE substr(e.work_date,1,7) = ? AND q.parts_qty > 0`).all(month);
-  const qcActualQty = qcDaysRows.reduce((a, r) => a + r.parts_qty, 0);
-  const qcBilledQty = mgBilling ? qcDaysRows.reduce((a, r) => a + Math.max(r.parts_qty, mg), 0) : qcActualQty;
-  const qcMgUplift = qcBilledQty - qcActualQty;
+  const qcCalc = calc.qcBilled(qcDaysRows.map(r => r.parts_qty), mg, mgBilling);
+  const qcActualQty = qcCalc.actual, qcBilledQty = qcCalc.billed, qcMgUplift = qcCalc.uplift;
 
   const loadingRev = agg.load_parts * rates.loading.rate;
   const unloadingRev = agg.unload_ton * rates.unloading.rate;
@@ -527,8 +561,7 @@ app.get('/api/billing', auth, requireRole('ADMIN', 'HQ'), (req, res) => {
   // Invoice
   const subtotal = totalRev;
   const gstPct = invoice.gst_pct || 0;
-  const gstAmt = Math.round(subtotal * gstPct) / 100;
-  const grandTotal = subtotal + gstAmt;
+  const { gst_amt: gstAmt, grand_total: grandTotal } = calc.gst(subtotal, gstPct);
 
   res.json({
     month, rates, mg, mgBilling,
@@ -620,7 +653,7 @@ app.put('/api/settings', auth, requireRole('ADMIN'), (req, res) => {
   if (b.transportRates) setSetting('transport_rates', b.transportRates);
   if (b.leavePolicy) setSetting('leave_policy', b.leavePolicy);
   audit(req.user.id, 'SETTINGS_UPDATE');
-  res.json({ config: clientConfig() });
+  res.json({ config: clientConfig(req.user) });
 });
 
 app.get('/api/users', auth, requireRole('ADMIN'), (req, res) => {
@@ -631,6 +664,7 @@ app.post('/api/users', auth, requireRole('ADMIN'), (req, res) => {
   const { name, username, password, role, company } = req.body || {};
   if (!name || !username || !password || !role || !company)
     return res.status(400).json({ error: 'All fields required' });
+  if (password.length < 5) return res.status(400).json({ error: 'Password must be at least 5 characters' });
   if (!config.ROLES[role]) return res.status(400).json({ error: 'Invalid role' });
   try {
     db.prepare(`INSERT INTO users (name, username, password_hash, role, company) VALUES (?,?,?,?,?)`)
@@ -924,17 +958,10 @@ app.get('/api/compliance/wage-register', auth, requireRole('ADMIN', 'HQ'), (req,
   let tot = { present: 0, gross: 0, ot: 0, pf: 0, esi: 0, net: 0 };
   const rows = workers.map(w => {
     const m = byW[w.id] || { p: 0, ot: 0 };
-    const perDay = w.wage_type === 'DAILY' ? (w.daily_wage || 0) : ((w.monthly_gross || 0) / stdDays);
-    const earnedGross = Math.round(perDay * m.p);
-    const hourly = perDay / 8;
-    const otPay = Math.round(m.ot * hourly * 2); // 2x overtime
-    const basicEarned = w.wage_type === 'DAILY' ? earnedGross : Math.round((w.basic || 0) / stdDays * m.p);
-    const pf = w.pf_applicable ? Math.round(basicEarned * 0.12) : 0;
-    const esi = (w.esi_applicable && (earnedGross + otPay) <= 21000) ? Math.round((earnedGross + otPay) * 0.0075) : 0;
-    const net = earnedGross + otPay - pf - esi;
-    tot.present += m.p; tot.gross += earnedGross; tot.ot += otPay; tot.pf += pf; tot.esi += esi; tot.net += net;
+    const r = calc.wageRow(w, m.p, m.ot, stdDays);
+    tot.present += m.p; tot.gross += r.gross; tot.ot += r.ot_pay; tot.pf += r.pf; tot.esi += r.esi; tot.net += r.net;
     return { id: w.id, roll_no: w.roll_no, name: w.name, department: w.department, wage_type: w.wage_type,
-      present_days: m.p, ot_hours: m.ot, gross: earnedGross, ot_pay: otPay, pf, esi, net };
+      present_days: m.p, ot_hours: m.ot, gross: r.gross, ot_pay: r.ot_pay, pf: r.pf, esi: r.esi, net: r.net };
   });
   res.json({ month, std_days: stdDays, rows, totals: tot });
 });
@@ -951,9 +978,30 @@ app.get('/api/compliance/document-expiry', auth, requireRole(...DRONA_HR), (req,
   res.json({ within_days: days, documents: rows });
 });
 
+// ---- Audit log (Admin) ----------------------------------------------------
+app.get('/api/audit', auth, requireRole('ADMIN'), (req, res) => {
+  const limit = Math.min(Number(req.query.limit) || 200, 500);
+  const rows = db.prepare(`SELECT a.id, a.action, a.detail, a.at, u.name AS user_name, u.username
+    FROM audit_log a LEFT JOIN users u ON u.id = a.user_id
+    ORDER BY a.id DESC LIMIT ?`).all(limit);
+  res.json({ entries: rows });
+});
+
 // ---- Static frontend ------------------------------------------------------
 app.use(express.static(path.join(__dirname, 'public')));
 app.get('*', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
+
+// JSON error handler — stops an uncaught route error from leaking an HTML stack
+// trace and always gives the SPA's fetch() a parseable body.
+app.use((err, req, res, next) => {
+  console.error('Unhandled error:', err);
+  if (res.headersSent) return next(err);
+  res.status(err.http || 500).json({ error: IS_PROD ? 'Server error' : (err.message || 'Server error') });
+});
+
+// Sweep expired sessions hourly (not only at login) so the table can't grow
+// indefinitely for users who never sign back in.
+setInterval(pruneSessions, 60 * 60 * 1000).unref();
 
 app.listen(PORT, () => {
   console.log(`\n  Drona ValueChain — JMC Ops Tracker`);

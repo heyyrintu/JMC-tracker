@@ -262,6 +262,22 @@ function init() {
   // Additive migrations (safe to run repeatedly; ignore "duplicate column").
   try { db.exec('ALTER TABLE daily_entries ADD COLUMN ppm INTEGER'); } catch (_) {}
   try { db.exec('ALTER TABLE worker_documents ADD COLUMN expiry_date TEXT'); } catch (_) {}
+
+  // Indexes for the hot filter/join paths (SQLite does not auto-index foreign
+  // keys). Created after the ALTERs so expiry_date exists. Safe to re-run.
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_entries_status    ON daily_entries(status);
+    CREATE INDEX IF NOT EXISTS idx_manpower_entry    ON manpower_actual(entry_id);
+    CREATE INDEX IF NOT EXISTS idx_trips_entry       ON transport_trips(entry_id);
+    CREATE INDEX IF NOT EXISTS idx_attendance_date   ON attendance(work_date);
+    CREATE INDEX IF NOT EXISTS idx_attendance_worker ON attendance(worker_id);
+    CREATE INDEX IF NOT EXISTS idx_disc_date         ON discrepancies(disc_date);
+    CREATE INDEX IF NOT EXISTS idx_disc_status       ON discrepancies(status);
+    CREATE INDEX IF NOT EXISTS idx_wdocs_worker      ON worker_documents(worker_id);
+    CREATE INDEX IF NOT EXISTS idx_wdocs_expiry      ON worker_documents(expiry_date);
+    CREATE INDEX IF NOT EXISTS idx_leave_worker      ON leave_applications(worker_id);
+    CREATE INDEX IF NOT EXISTS idx_sessions_user     ON sessions(user_id);
+  `);
 }
 
 function getSetting(key, fallback = null) {
