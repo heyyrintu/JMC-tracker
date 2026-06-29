@@ -1,0 +1,361 @@
+// Drona ValueChain — JMC Operations Tracker
+// PostgreSQL schema (migrated from the original node:sqlite schema in db.js).
+//
+// Conventions:
+//   - @@map / @map keep the original snake_case table & column names so existing
+//     SQL ($queryRaw aggregations) and the ETL importer line up 1:1.
+//   - Business dates the app treats as plain 'YYYY-MM-DD' strings (work_date,
+//     from_date, expiry_date, dob, ...) stay String to preserve substr()/range
+//     logic. Audit/lifecycle timestamps become real `timestamptz`.
+//   - SQLite integer-booleans (active, pf_applicable, ...) become real Boolean.
+//   - settings.value (JSON text) becomes jsonb.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id           Int      @id @default(autoincrement())
+  name         String
+  username     String   @unique
+  passwordHash String   @map("password_hash")
+  role         String // OPERATOR | JMC_APPROVER | HQ | ADMIN
+  company      String // DRONA | JMC
+  active       Boolean  @default(true)
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  sessions Session[]
+
+  @@map("users")
+}
+
+model Session {
+  token     String   @id
+  userId    Int      @map("user_id")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId], map: "idx_sessions_user")
+  @@map("sessions")
+}
+
+// Key/value settings (rates, MG, approved manpower, ...) as jsonb.
+model Setting {
+  key       String   @id
+  value     Json
+  updatedAt DateTime @default(now()) @map("updated_at")
+
+  @@map("settings")
+}
+
+// One record per operating day.
+model DailyEntry {
+  id          Int       @id @default(autoincrement())
+  workDate    String    @unique @map("work_date") // YYYY-MM-DD
+  status      String    @default("DRAFT") // DRAFT | SUBMITTED | APPROVED | REJECTED
+  shift       String?   @default("DAY")
+  notes       String?
+  ppm         Int?
+  createdBy   Int?      @map("created_by")
+  submittedAt DateTime? @map("submitted_at")
+  approvedBy  Int?      @map("approved_by")
+  approvedAt  DateTime? @map("approved_at")
+  jmcRemarks  String?   @map("jmc_remarks")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @default(now()) @map("updated_at")
+
+  manpower    ManpowerActual[]
+  loading     Loading?
+  unloading   Unloading?
+  qc          Qc?
+  qcLines     QcLine[]
+  transport   TransportTrip[]
+  attachments Attachment[]
+
+  @@index([status], map: "idx_entries_status")
+  @@map("daily_entries")
+}
+
+// Actual manpower deployed per category for a day.
+model ManpowerActual {
+  id            Int    @id @default(autoincrement())
+  entryId       Int    @map("entry_id")
+  category      String // LOADER | UNLOADER | INSPECTOR | SUPERVISOR
+  approvedCount Int    @default(0) @map("approved_count")
+  actualCount   Int    @default(0) @map("actual_count")
+
+  entry DailyEntry @relation(fields: [entryId], references: [id], onDelete: Cascade)
+
+  @@index([entryId], map: "idx_manpower_entry")
+  @@map("manpower_actual")
+}
+
+model Loading {
+  entryId       Int @id @map("entry_id")
+  partsQty      Int @default(0) @map("parts_qty")
+  manpowerCount Int @default(0) @map("manpower_count")
+  truckCount    Int @default(0) @map("truck_count")
+
+  entry DailyEntry @relation(fields: [entryId], references: [id], onDelete: Cascade)
+
+  @@map("loading")
+}
+
+model Unloading {
+  entryId       Int   @id @map("entry_id")
+  truckCount    Int   @default(0) @map("truck_count")
+  weightTon     Float @default(0) @map("weight_ton")
+  manpowerCount Int   @default(0) @map("manpower_count")
+
+  entry DailyEntry @relation(fields: [entryId], references: [id], onDelete: Cascade)
+
+  @@map("unloading")
+}
+
+model Qc {
+  entryId       Int @id @map("entry_id")
+  partsQty      Int @default(0) @map("parts_qty")
+  manpowerCount Int @default(0) @map("manpower_count")
+
+  entry DailyEntry @relation(fields: [entryId], references: [id], onDelete: Cascade)
+
+  @@map("qc")
+}
+
+// Per-part QC inspection lines: checked / rejected / rework + defect type.
+model QcLine {
+  id          Int     @id @default(autoincrement())
+  entryId     Int     @map("entry_id")
+  partNo      String? @map("part_no")
+  checkedQty  Int     @default(0) @map("checked_qty")
+  rejectedQty Int     @default(0) @map("rejected_qty")
+  reworkQty   Int     @default(0) @map("rework_qty")
+  defectType  String? @map("defect_type")
+  remarks     String?
+
+  entry DailyEntry @relation(fields: [entryId], references: [id], onDelete: Cascade)
+
+  @@index([entryId], map: "idx_qclines_entry")
+  @@map("qc_lines")
+}
+
+// PDI parts master (imported from the JMC parts sheet).
+model PdiPart {
+  id          Int      @id @default(autoincrement())
+  partNo      String   @unique @map("part_no")
+  category    String   @default("OTHER") // CHASSIS | BUS_BODY | OTHER
+  description String?
+  active      Boolean  @default(true)
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  @@index([active], map: "idx_pdiparts_active")
+  @@map("pdi_parts")
+}
+
+// Individual transport trips.
+model TransportTrip {
+  id          Int     @id @default(autoincrement())
+  entryId     Int     @map("entry_id")
+  fromLoc     String  @map("from_loc")
+  toLoc       String  @map("to_loc")
+  vehicleType String  @map("vehicle_type")
+  tripTime    String? @map("trip_time") // HH:MM
+  remarks     String?
+
+  entry DailyEntry @relation(fields: [entryId], references: [id], onDelete: Cascade)
+
+  @@index([entryId], map: "idx_trips_entry")
+  @@map("transport_trips")
+}
+
+// Extra-manpower requests (raised on site, approved by HQ).
+model ManpowerRequest {
+  id              Int       @id @default(autoincrement())
+  reqDate         String    @map("req_date")
+  neededDate      String?   @map("needed_date")
+  category        String
+  extraCount      Int       @map("extra_count")
+  reason          String?
+  ppmCurrent      Int?      @map("ppm_current")
+  status          String    @default("PENDING") // PENDING | APPROVED | REJECTED
+  requestedBy     Int?      @map("requested_by")
+  decidedBy       Int?      @map("decided_by")
+  decidedAt       DateTime? @map("decided_at")
+  decisionRemarks String?   @map("decision_remarks")
+  createdAt       DateTime  @default(now()) @map("created_at")
+
+  @@map("manpower_requests")
+}
+
+// Photo / file attachments (proof of work) linked to a day.
+model Attachment {
+  id         Int      @id @default(autoincrement())
+  entryId    Int      @map("entry_id")
+  filename   String
+  caption    String?
+  uploadedBy Int?     @map("uploaded_by")
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  entry DailyEntry @relation(fields: [entryId], references: [id], onDelete: Cascade)
+
+  @@map("attachments")
+}
+
+// Discrepancy log — the JMC "concern areas".
+model Discrepancy {
+  id            Int       @id @default(autoincrement())
+  discDate      String    @map("disc_date")
+  type          String // DISPATCH_VS_BILL | WRONG_PART | QR_ISSUE | TPH_HYZINE | OTHER
+  partNo        String?   @map("part_no")
+  description   String?
+  qtyDispatched Int?      @map("qty_dispatched")
+  qtyBilled     Int?      @map("qty_billed")
+  qrCode        String?   @map("qr_code")
+  severity      String    @default("MEDIUM") // LOW | MEDIUM | HIGH
+  status        String    @default("OPEN") // OPEN | RESOLVED
+  raisedBy      Int?      @map("raised_by")
+  raisedCompany String?   @map("raised_company")
+  resolution    String?
+  resolvedBy    Int?      @map("resolved_by")
+  resolvedAt    DateTime? @map("resolved_at")
+  qcEntryId     Int?      @map("qc_entry_id")
+  createdAt     DateTime  @default(now()) @map("created_at")
+
+  @@index([discDate], map: "idx_disc_date")
+  @@index([status], map: "idx_disc_status")
+  @@map("discrepancies")
+}
+
+// Worker master (HR records — NOT app logins).
+model Worker {
+  id                Int       @id @default(autoincrement())
+  rollNo            String?   @unique @map("roll_no")
+  name              String
+  fatherName        String?   @map("father_name")
+  gender            String?
+  dob               String?
+  bloodGroup        String?   @map("blood_group")
+  mobile            String?
+  address           String?
+  aadhaar           String?
+  pan               String?
+  uan               String?
+  esicNo            String?   @map("esic_no")
+  department        String? // LOADER | UNLOADER | INSPECTOR | SUPERVISOR | OTHER
+  designation       String?
+  dateOfJoining     String?   @map("date_of_joining")
+  dateOfExit        String?   @map("date_of_exit")
+  supervisor        String?
+  wageType          String?   @default("MONTHLY") @map("wage_type")
+  monthlyGross      Float     @default(0) @map("monthly_gross")
+  dailyWage         Float     @default(0) @map("daily_wage")
+  basic             Float     @default(0)
+  hra               Float     @default(0)
+  allowances        Float     @default(0)
+  pfApplicable      Boolean   @default(true) @map("pf_applicable")
+  esiApplicable     Boolean   @default(true) @map("esi_applicable")
+  bankHolder        String?   @map("bank_holder")
+  bankName          String?   @map("bank_name")
+  accountNo         String?   @map("account_no")
+  ifsc              String?
+  emergencyName     String?   @map("emergency_name")
+  emergencyPhone    String?   @map("emergency_phone")
+  emergencyRelation String?   @map("emergency_relation")
+  status            String    @default("ACTIVE") // ACTIVE | INACTIVE
+  photo             String?
+  // Onboarding workflow: DRAFT -> PENDING -> APPROVED/REJECTED.
+  onboardStatus     String    @default("APPROVED") @map("onboard_status")
+  submittedBy       Int?      @map("submitted_by")
+  submittedAt       DateTime? @map("submitted_at")
+  approvedBy        Int?      @map("approved_by")
+  approvedAt        DateTime? @map("approved_at")
+  approvalRemarks   String?   @map("approval_remarks")
+  offerLetterFile   String?   @map("offer_letter_file")
+  offerLetterAt     DateTime? @map("offer_letter_at")
+  offerTerms        String?   @map("offer_terms") // JSON snapshot of the generated letter
+  createdAt         DateTime  @default(now()) @map("created_at")
+  updatedAt         DateTime  @default(now()) @map("updated_at")
+
+  documents  WorkerDocument[]
+  attendance Attendance[]
+  leaves     LeaveApplication[]
+
+  @@index([onboardStatus], map: "idx_workers_onboard")
+  @@map("workers")
+}
+
+model WorkerDocument {
+  id         Int      @id @default(autoincrement())
+  workerId   Int      @map("worker_id")
+  docType    String?  @map("doc_type")
+  docSlot    String?  @map("doc_slot")
+  filename   String
+  caption    String?
+  expiryDate String?  @map("expiry_date")
+  uploadedBy Int?     @map("uploaded_by")
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  worker Worker @relation(fields: [workerId], references: [id], onDelete: Cascade)
+
+  @@index([workerId], map: "idx_wdocs_worker")
+  @@index([expiryDate], map: "idx_wdocs_expiry")
+  @@map("worker_documents")
+}
+
+model Attendance {
+  id        Int      @id @default(autoincrement())
+  workDate  String   @map("work_date")
+  workerId  Int      @map("worker_id")
+  status    String   @default("PRESENT") // PRESENT | ABSENT | HALF_DAY | LEAVE | WEEKLY_OFF
+  inTime    String?  @map("in_time")
+  outTime   String?  @map("out_time")
+  otHours   Float    @default(0) @map("ot_hours")
+  remarks   String?
+  markedBy  Int?     @map("marked_by")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  worker Worker @relation(fields: [workerId], references: [id], onDelete: Cascade)
+
+  @@unique([workDate, workerId])
+  @@index([workDate], map: "idx_attendance_date")
+  @@index([workerId], map: "idx_attendance_worker")
+  @@map("attendance")
+}
+
+model LeaveApplication {
+  id              Int       @id @default(autoincrement())
+  workerId        Int       @map("worker_id")
+  leaveType       String    @map("leave_type") // CL | SL | EL | LWP
+  fromDate        String    @map("from_date")
+  toDate          String    @map("to_date")
+  days            Float     @default(1)
+  reason          String?
+  status          String    @default("PENDING") // PENDING | APPROVED | REJECTED
+  appliedBy       Int?      @map("applied_by")
+  decidedBy       Int?      @map("decided_by")
+  decidedAt       DateTime? @map("decided_at")
+  decisionRemarks String?   @map("decision_remarks")
+  createdAt       DateTime  @default(now()) @map("created_at")
+
+  worker Worker @relation(fields: [workerId], references: [id], onDelete: Cascade)
+
+  @@index([workerId], map: "idx_leave_worker")
+  @@map("leave_applications")
+}
+
+// Lightweight audit trail.
+model AuditLog {
+  id     Int      @id @default(autoincrement())
+  userId Int?     @map("user_id")
+  action String
+  detail String?
+  at     DateTime @default(now())
+
+  @@map("audit_log")
+}
