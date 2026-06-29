@@ -29,14 +29,14 @@ function toast(msg, kind = '') {
 }
 
 const ROLE_NAV = {
-  OPERATOR:     ['dashboard','entry','workers','attendance','leave','compliance','discrepancies','requests','reports','mis'],
+  OPERATOR:     ['dashboard','entry','workers','onboarding','attendance','leave','compliance','discrepancies','requests','reports','mis'],
   JMC_APPROVER: ['dashboard','approvals','discrepancies','reports','mis'],
-  HQ:           ['dashboard','workers','attendance','leave','compliance','discrepancies','requests','reports','mis','billing'],
-  ADMIN:        ['dashboard','entry','workers','attendance','leave','compliance','approvals','discrepancies','requests','reports','mis','billing','settings','users','audit'],
+  HQ:           ['dashboard','workers','onboarding','attendance','leave','compliance','discrepancies','requests','reports','mis','billing'],
+  ADMIN:        ['dashboard','entry','workers','onboarding','attendance','leave','compliance','approvals','discrepancies','requests','reports','mis','billing','settings','users','audit'],
 };
 const NAV_META = {
   dashboard:{ic:'▤',label:'Dashboard'}, entry:{ic:'✎',label:'Daily Entry'},
-  workers:{ic:'⚇',label:'Workers'}, attendance:{ic:'🗓',label:'Attendance'},
+  workers:{ic:'⚇',label:'Workers'}, onboarding:{ic:'🪪',label:'Onboarding'}, attendance:{ic:'🗓',label:'Attendance'},
   leave:{ic:'🏖',label:'Leave'}, compliance:{ic:'⚖',label:'Compliance'},
   approvals:{ic:'✔',label:'EOD Approvals'}, discrepancies:{ic:'⚠',label:'Discrepancies'},
   requests:{ic:'＋',label:'Manpower Requests'},
@@ -136,6 +136,7 @@ async function refreshBadges() {
     };
     if (['JMC_APPROVER','ADMIN'].includes(State.user.role)) set('approvals', s.pending_approvals);
     if (['HQ','ADMIN'].includes(State.user.role)) set('requests', s.pending_mp_requests);
+    if (['HQ','ADMIN'].includes(State.user.role)) set('onboarding', s.pending_onboarding);
     set('discrepancies', s.open_discrepancies);
     if (['HQ','ADMIN'].includes(State.user.role)) set('leave', s.pending_leaves);
     set('compliance', s.expiring_docs);
@@ -156,6 +157,65 @@ function resizeImage(file, maxPx = 1280, quality = 0.7) {
     };
     img.onerror = reject;
     const fr = new FileReader(); fr.onload = () => img.src = fr.result; fr.onerror = reject; fr.readAsDataURL(file);
+  });
+}
+
+// Worker documents may be PDF or image. PDFs are sent as-is; images are resized.
+function fileToUpload(file, maxPx = 1280, quality = 0.7) {
+  if (file.type === 'application/pdf')
+    return new Promise((res, rej) => { const fr = new FileReader(); fr.onload = () => res(fr.result); fr.onerror = rej; fr.readAsDataURL(file); });
+  return resizeImage(file, maxPx, quality);
+}
+
+// Load the PDI parts master once (cached on State for the autocomplete).
+async function ensurePdiParts() {
+  if (State.pdiParts) return State.pdiParts;
+  try { State.pdiParts = (await api('/pdi-parts')).parts; } catch (_) { State.pdiParts = State.pdiParts || []; }
+  return State.pdiParts;
+}
+
+// Custom autocomplete for PDI part numbers. Replaces the native <datalist>,
+// whose dropdown / scrollbar the browser renders and CSS can't style. Filters
+// as you type, supports keyboard nav, and still allows free text.
+let pdiDD;
+function pdiAutocomplete(input) {
+  if (!input) return;
+  if (!pdiDD) {
+    pdiDD = h('<div class="pdi-dd" style="display:none"></div>');
+    document.body.appendChild(pdiDD);
+    // Close on page scroll, but NOT when scrolling inside the dropdown itself.
+    window.addEventListener('scroll', (ev) => {
+      if (ev.target === pdiDD || (pdiDD.contains && ev.target.nodeType && pdiDD.contains(ev.target))) return;
+      pdiDD.style.display = 'none'; pdiDD._owner = null;
+    }, true);
+  }
+  let items = [], active = -1;
+  const close = () => { if (pdiDD._owner === input) { pdiDD.style.display = 'none'; pdiDD._owner = null; } };
+  function render() {
+    const q = (input.value || '').trim().toUpperCase();
+    const all = State.pdiParts || [];
+    items = (q ? all.filter(p => p.part_no.toUpperCase().includes(q)) : all).slice(0, 80);
+    if (!items.length) { close(); return; }
+    pdiDD._owner = input;
+    pdiDD.innerHTML = items.map((p, i) => `<div class="pdi-opt${i === active ? ' active' : ''}" data-i="${i}"><span class="pn">${esc(p.part_no)}</span><span class="cat">${esc(p.category)}</span></div>`).join('');
+    const r = input.getBoundingClientRect();
+    pdiDD.style.left = Math.round(r.left) + 'px';
+    pdiDD.style.top = Math.round(r.bottom + 2) + 'px';
+    pdiDD.style.minWidth = Math.round(r.width) + 'px';
+    pdiDD.style.display = 'block';
+    pdiDD.querySelectorAll('.pdi-opt').forEach(el => el.addEventListener('mousedown', ev => { ev.preventDefault(); choose(+el.dataset.i); }));
+  }
+  function choose(i) { if (items[i]) { input.value = items[i].part_no; input.dispatchEvent(new Event('input', { bubbles: true })); } close(); }
+  function scrollActive() { const el = pdiDD.querySelector('.pdi-opt.active'); if (el) el.scrollIntoView({ block: 'nearest' }); }
+  input.addEventListener('focus', () => ensurePdiParts().then(() => { active = -1; render(); }));
+  input.addEventListener('input', () => { active = -1; render(); });
+  input.addEventListener('blur', () => setTimeout(close, 150));
+  input.addEventListener('keydown', ev => {
+    if (pdiDD.style.display === 'none' || pdiDD._owner !== input) return;
+    if (ev.key === 'ArrowDown') { active = Math.min(active + 1, items.length - 1); ev.preventDefault(); render(); scrollActive(); }
+    else if (ev.key === 'ArrowUp') { active = Math.max(active - 1, 0); ev.preventDefault(); render(); scrollActive(); }
+    else if (ev.key === 'Enter') { if (active >= 0) { ev.preventDefault(); choose(active); } }
+    else if (ev.key === 'Escape') { close(); }
   });
 }
 
@@ -345,14 +405,13 @@ ROUTES.entry = async function () {
       </div>
 
       <div class="card"><h3>🔎 PTL / Quality Check (PDI) <span class="muted small">(per part · MG ${mgTarget}/day)</span></h3>
-        <div class="row g2">
-          <div class="field"><label>Parts checked</label><input type="number" min="0" id="qParts" value="${Q.parts_qty||''}" ${locked?'disabled':''}>
-            <div class="small" id="mgHint" style="margin-top:5px"></div></div>
-          <div class="field"><label>QC Inspectors (manpower)</label><input type="number" min="0" id="qMp" value="${Q.manpower_count||''}" ${locked?'disabled':''}></div>
-        </div></div>
-
-      <div class="card"><h3>📉 PPM <span class="muted small">(production / quality number — target ${fmt(State.cfg.ppmTarget)}, lower is better)</span></h3>
-        <div class="field" style="max-width:260px"><label>PPM for the day</label>
+        <div class="field" style="max-width:220px"><label>QC Inspectors (manpower)</label><input type="number" min="0" id="qMp" value="${Q.manpower_count||''}" ${locked?'disabled':''}></div>
+        <div style="overflow-x:auto;margin-top:8px"><table class="qctab"><thead><tr>
+          <th style="min-width:120px">Part no.</th><th class="num">Checked</th><th class="num">Rejected</th><th class="num">Rework</th><th>Defect</th><th></th>
+        </tr></thead><tbody id="qcRows"></tbody></table></div>
+        ${locked?'':`<button class="btn ghost sm" id="qcAdd" style="margin-top:8px">＋ Add part line</button>`}
+        <div id="qcSummary" class="qc-summary" style="margin-top:12px"></div>
+        <div class="field" style="max-width:300px;margin-top:10px"><label>PPM <span class="muted small">(auto from defects when parts are inspected — target ${fmt(State.cfg.ppmTarget)}, lower is better)</span></label>
           <input type="number" min="0" id="ppm" value="${e&&e.ppm!=null?e.ppm:''}" ${locked?'disabled':''} placeholder="e.g. 850"></div></div>
 
       <div class="card"><h3>🚚 Transportation <span class="muted small">(from → to · vehicle · time)</span></h3>
@@ -376,14 +435,74 @@ ROUTES.entry = async function () {
     </div>`);
     $('#entryForm').innerHTML = ''; $('#entryForm').appendChild(form);
 
-    // MG hint
-    const qParts = $('#qParts');
-    const updMg = () => {
-      const val = Number(qParts.value) || 0;
-      $('#mgHint').innerHTML = val === 0 ? '' :
-        (val >= mgTarget ? `<span class="pill ok">MG met</span>` : `<span class="pill bad">Below MG by ${mgTarget - val}</span>`);
-    };
-    if (qParts) { qParts.addEventListener('input', updMg); updMg(); }
+    // QC inspection lines + derived quality summary (PPM / FPY)
+    const defectTypes = State.cfg.defectTypes || [];
+    ensurePdiParts();  // populate the part-number datalist
+    const qcRowsEl = $('#qcRows');
+    const ppmEl = $('#ppm');
+    function readQcRows() {
+      return [...qcRowsEl.querySelectorAll('.qc-row')].map(tr => {
+        const o = {}; tr.querySelectorAll('[data-q]').forEach(i => o[i.dataset.q] = i.value); return o;
+      });
+    }
+    function updateQcSummary() {
+      const rows = readQcRows();
+      let chk = 0, rej = 0, rw = 0;
+      rows.forEach(r => { chk += +r.checked_qty || 0; rej += +r.rejected_qty || 0; rw += +r.rework_qty || 0; });
+      const passed = Math.max(0, chk - rej - rw);
+      const fpy = chk ? ((passed / chk) * 100).toFixed(1) : null;
+      const ppm = chk ? Math.round((rej / chk) * 1e6) : null;
+      const mgPill = chk === 0 ? '' : (chk >= mgTarget ? `<span class="pill ok">MG met</span>` : `<span class="pill bad">Below MG by ${mgTarget - chk}</span>`);
+      $('#qcSummary').innerHTML = `<div class="inline" style="gap:16px;flex-wrap:wrap">
+        <div><span class="muted small">Checked</span><div><b>${fmt(chk)}</b> ${mgPill}</div></div>
+        <div><span class="muted small">Rejected</span><div><b>${fmt(rej)}</b></div></div>
+        <div><span class="muted small">Rework</span><div><b>${fmt(rw)}</b></div></div>
+        <div><span class="muted small">First-pass yield</span><div><b>${fpy != null ? fpy + '%' : '—'}</b></div></div>
+        <div><span class="muted small">PPM (derived)</span><div><b>${ppm != null ? fmt(ppm) : '—'}</b></div></div>
+      </div>`;
+      if (ppmEl) { if (chk > 0) { ppmEl.value = ppm; ppmEl.disabled = true; } else { ppmEl.disabled = locked; } }
+    }
+    function qcRow(l = {}) {
+      const opt = defectTypes.map(d => `<option ${d === l.defect_type ? 'selected' : ''}>${esc(d)}</option>`).join('');
+      const tr = h(`<tr class="qc-row">
+        <td><input data-q="part_no" autocomplete="off" value="${esc(l.part_no || '')}" ${locked ? 'disabled' : ''}></td>
+        <td><input type="number" min="0" class="num" data-q="checked_qty" value="${l.checked_qty || ''}" ${locked ? 'disabled' : ''}></td>
+        <td><input type="number" min="0" class="num" data-q="rejected_qty" value="${l.rejected_qty || ''}" ${locked ? 'disabled' : ''}></td>
+        <td><input type="number" min="0" class="num" data-q="rework_qty" value="${l.rework_qty || ''}" ${locked ? 'disabled' : ''}></td>
+        <td><select data-q="defect_type" ${locked ? 'disabled' : ''}><option value="">—</option>${opt}</select></td>
+        <td class="qc-act"></td></tr>`);
+      const act = tr.querySelector('.qc-act');
+      if (e) { const rd = h(`<button class="btn ghost sm" title="Raise discrepancy from this defect">⚠</button>`); rd.addEventListener('click', () => discFromQc(tr)); act.appendChild(rd); }
+      if (!locked) { const del = h(`<button class="btn ghost sm" data-qdel>✕</button>`); del.addEventListener('click', () => { tr.remove(); updateQcSummary(); }); act.appendChild(del); }
+      tr.querySelectorAll('[data-q]').forEach(i => i.addEventListener('input', updateQcSummary));
+      if (!locked) pdiAutocomplete(tr.querySelector('[data-q="part_no"]'));
+      qcRowsEl.appendChild(tr);
+    }
+    function discFromQc(tr) {
+      const o = {}; tr.querySelectorAll('[data-q]').forEach(i => o[i.dataset.q] = i.value);
+      const map = { WRONG_PART: 'WRONG_PART', QR_ISSUE: 'QR_ISSUE' };
+      const dtype = map[o.defect_type] || 'OTHER';
+      const ov = h(`<div class="modal-backdrop"><div class="modal">
+        <h3>Raise discrepancy from QC</h3>
+        <div class="field"><label>Type</label><select id="dq_type">${['DISPATCH_VS_BILL','WRONG_PART','QR_ISSUE','TPH_HYZINE','OTHER'].map(t => `<option ${t === dtype ? 'selected' : ''}>${t}</option>`).join('')}</select></div>
+        <div class="field"><label>Part no.</label><input id="dq_part" value="${esc(o.part_no || '')}"></div>
+        <div class="field"><label>Severity</label><select id="dq_sev"><option>LOW</option><option selected>MEDIUM</option><option>HIGH</option></select></div>
+        <div class="field"><label>Description</label><textarea id="dq_desc" rows="2">QC defect: ${esc(o.defect_type || '—')}${o.rejected_qty ? (' · ' + o.rejected_qty + ' rejected') : ''}</textarea></div>
+        <div class="btn-row" style="justify-content:flex-end"><button class="btn ghost" id="dq_cancel">Cancel</button><button class="btn primary" id="dq_save">Raise</button></div>
+      </div></div>`);
+      document.body.appendChild(ov);
+      const close = () => ov.remove();
+      ov.querySelector('#dq_cancel').addEventListener('click', close);
+      ov.addEventListener('click', ev => { if (ev.target === ov) close(); });
+      ov.querySelector('#dq_save').addEventListener('click', async () => {
+        try { await api('/discrepancies', { method: 'POST', body: { type: $('#dq_type').value, part_no: $('#dq_part').value, severity: $('#dq_sev').value, description: $('#dq_desc').value, disc_date: date, qc_entry_id: e.id } }); toast('Discrepancy raised', 'ok'); close(); refreshBadges(); }
+        catch (err) { toast(err.message, 'bad'); }
+      });
+    }
+    (Q.lines && Q.lines.length ? Q.lines : []).forEach(qcRow);
+    if (!locked && qcRowsEl.children.length === 0) qcRow();
+    const qcAddBtn = $('#qcAdd'); if (qcAddBtn) qcAddBtn.addEventListener('click', () => qcRow());
+    updateQcSummary();
 
     // Transport rows
     const tripsEl = $('#trips');
@@ -451,7 +570,7 @@ ROUTES.entry = async function () {
         ppm: $('#ppm') ? $('#ppm').value : '',
         loading: { parts_qty: $('#lParts').value, manpower_count: $('#lMp').value, truck_count: $('#lTrucks').value },
         unloading: { truck_count: $('#uTrucks').value, weight_ton: $('#uTon').value, manpower_count: $('#uMp').value },
-        qc: { parts_qty: $('#qParts').value, manpower_count: $('#qMp').value },
+        qc: { manpower_count: $('#qMp').value, lines: readQcRows() },
       };
     }
     async function save(submit) {
@@ -691,7 +810,20 @@ ROUTES.settings = async function () {
       </div>
       <div class="field"><label>Invoice notes</label><input id="invNotes" value="${esc((c.invoice||{}).notes||'')}"></div>
       <label class="inline"><input type="checkbox" id="mgBill" ${c.mgBilling?'checked':''} style="width:auto"> Bill QC at the guaranteed minimum (MG floor per day)</label></div>
-     <button class="btn primary" id="saveSet">Save settings</button>`;
+     <button class="btn primary" id="saveSet">Save settings</button>
+     <div class="card" style="margin-top:16px"><h3>PDI Parts Master <span class="muted small">(part numbers suggested on QC inspection lines)</span></h3>
+       <div id="pdiSummary" class="muted small">Loading…</div>
+       <div class="btn-row" style="margin-top:10px">
+         <input id="pdiNewNo" placeholder="Part no." style="max-width:160px">
+         <select id="pdiNewCat" style="width:auto"><option>CHASSIS</option><option>BUS_BODY</option><option>OTHER</option></select>
+         <button class="btn ghost sm" id="pdiAddBtn">＋ Add part</button>
+       </div>
+       <details style="margin-top:10px"><summary class="small" style="cursor:pointer">Bulk import / re-upload (paste part numbers)</summary>
+         <div style="margin-top:8px"><select id="pdiImpCat" style="width:auto"><option>CHASSIS</option><option>BUS_BODY</option><option>OTHER</option></select>
+           <textarea id="pdiImpText" rows="3" placeholder="Paste part numbers — space, comma or newline separated" style="margin-top:6px;width:100%"></textarea>
+           <button class="btn ghost sm" id="pdiImpBtn" style="margin-top:6px">Import</button></div></details>
+       <div id="pdiList" style="margin-top:12px;max-height:320px;overflow:auto"></div>
+     </div>`;
   $('#saveSet').addEventListener('click', async () => {
     const approvedManpower = c.approvedManpower.map((m,i)=>({ ...m, approved: Number(document.querySelector(`[data-i="${i}"]`).value)||0 }));
     const body = {
@@ -707,6 +839,24 @@ ROUTES.settings = async function () {
     try { const r = await api('/settings', { method:'PUT', body }); State.cfg = r.config; toast('Settings saved','ok'); ROUTES.settings(); }
     catch (e) { toast(e.message,'bad'); }
   });
+
+  // ---- PDI parts master management ----
+  async function loadPdi() {
+    let parts;
+    try { parts = (await api('/pdi-parts?all=1')).parts; } catch (e) { $('#pdiList').innerHTML = `<div class="muted small">${esc(e.message)}</div>`; return; }
+    const byCat = {}; parts.forEach(p => (byCat[p.category] = byCat[p.category] || []).push(p));
+    const activeCount = parts.filter(p => p.active).length;
+    $('#pdiSummary').innerHTML = `${activeCount} active / ${parts.length} total · ` + Object.keys(byCat).map(k => `${esc(k)}: ${byCat[k].length}`).join(' · ');
+    $('#pdiList').innerHTML = Object.keys(byCat).sort().map(cat => `<div style="margin-bottom:10px">
+      <div class="small" style="font-weight:600;margin-bottom:4px">${esc(cat)} <span class="muted">(${byCat[cat].length})</span></div>
+      <div class="inline" style="gap:6px;flex-wrap:wrap">${byCat[cat].map(p => `<span class="pill ${p.active?'ok':'bad'}" data-pid="${p.id}" style="cursor:pointer" title="click to ${p.active?'deactivate':'activate'}">${esc(p.part_no)}</span>`).join('')}</div></div>`).join('');
+    $('#pdiList').querySelectorAll('[data-pid]').forEach(el => el.addEventListener('click', async () => { try { await api('/pdi-parts/'+el.dataset.pid+'/toggle',{method:'POST'}); State.pdiParts = null; loadPdi(); } catch (e) { toast(e.message,'bad'); } }));
+  }
+  $('#pdiAddBtn').addEventListener('click', async () => { const part_no = $('#pdiNewNo').value.trim(); if (!part_no) { toast('Enter a part number','bad'); return; }
+    try { await api('/pdi-parts',{method:'POST',body:{part_no,category:$('#pdiNewCat').value}}); $('#pdiNewNo').value=''; State.pdiParts = null; toast('Part added','ok'); loadPdi(); } catch (e) { toast(e.message,'bad'); } });
+  $('#pdiImpBtn').addEventListener('click', async () => { const text = $('#pdiImpText').value; if (!text.trim()) { toast('Paste some part numbers','bad'); return; }
+    try { const r = await api('/pdi-parts/import',{method:'POST',body:{category:$('#pdiImpCat').value,text}}); $('#pdiImpText').value=''; State.pdiParts = null; toast(`Imported: ${r.added} new, ${r.updated} updated`,'ok'); loadPdi(); } catch (e) { toast(e.message,'bad'); } });
+  loadPdi();
 };
 
 // ===========================================================================
@@ -943,6 +1093,23 @@ ROUTES.mis = async function () {
     if (ppmItems.length) html += chartCard('PPM Trend', `target ${fmt(M.ppmTarget)} · avg ${M.ppmAvg!=null?fmt(M.ppmAvg):'—'} (lower is better)`,
       svgBars(ppmItems, { target: M.ppmTarget, targetLabel: 'Target '+M.ppmTarget, showVal:true }));
 
+    // QC quality — inspection outcomes (from per-part PDI lines)
+    const qq = M.qcQuality;
+    if (qq && qq.checked > 0) {
+      const qkpis = [
+        ['tint-brand','Parts Inspected', fmt(qq.checked), `${fmt(qq.passed)} passed`],
+        ['tint-'+(qq.rejection_rate>0?'warn':'ok'),'Rejection Rate', qq.rejection_rate+'%', `${fmt(qq.rejected)} rejected · ${fmt(qq.rework)} rework`],
+        ['tint-'+(qq.fpy>=99?'ok':'warn'),'First-Pass Yield', (qq.fpy!=null?qq.fpy+'%':'—'), 'passed / checked'],
+        ['tint-'+(M.ppmTarget && qq.ppm_derived>M.ppmTarget?'warn':'ok'),'PPM (from defects)', qq.ppm_derived!=null?fmt(qq.ppm_derived):'—', `target ${fmt(M.ppmTarget)}`],
+      ];
+      html += `<div class="grid g4" style="margin:4px 0 16px">` +
+        qkpis.map(k => `<div class="kpi ${k[0]}"><div class="l">${k[1]}</div><div class="v">${k[2]}</div><div class="sub muted">${k[3]}</div></div>`).join('') + `</div>`;
+      if (M.defectPareto && M.defectPareto.length) {
+        const dItems = M.defectPareto.map(d => ({ label: d.defect_type, value: d.qty, color: '#dc2626' }));
+        html += chartCard('Defect Pareto', 'rejected parts by defect type', svgBars(dItems, { showVal:true }));
+      }
+    }
+
     // Manpower utilization
     const mpMap = Object.fromEntries(M.mpCat.map(m => [m.category, m]));
     html += `<div class="card"><h3>Manpower Utilization <span class="muted small">avg actual vs approved (MG)</span></h3>
@@ -1065,7 +1232,8 @@ const deb = (fn, ms) => { let t; return (...a) => { clearTimeout(t); t = setTime
 ROUTES.workers = async function () {
   const canManage = ['OPERATOR','ADMIN'].includes(State.user.role);
   const v = $('#view');
-  showList();
+  const deep = State.openWorker; State.openWorker = null;  // deep-link from Onboarding queue
+  if (deep) showForm(deep); else showList();
 
   async function showList() {
     v.innerHTML = topbar('Workers — HR Master', 'Manpower profiles, salary structure and documents.') +
@@ -1105,9 +1273,10 @@ ROUTES.workers = async function () {
     const sel = (val, opts) => opts.map(o => `<option ${o===val?'selected':''}>${esc(o)}</option>`).join('');
     v.innerHTML = topbar(id?('Worker — '+w.name):'New Worker', id?('Roll '+(w.roll_no||'—')):'Add a manpower profile') +
      `<div class="card noprint"><button class="btn ghost sm" id="wback">← Back to list</button></div>
+      ${id?'<div id="wbanner"></div>':''}
       <div class="card"><div class="inline" style="gap:16px">
         <div id="wphoto" style="width:84px;height:84px;border-radius:10px;background:#eef2f7;overflow:hidden;display:flex;align-items:center;justify-content:center;color:#94a3b8;font-size:11px">${w.photo_url?`<img src="${w.photo_url}" style="width:100%;height:100%;object-fit:cover">`:'No photo'}</div>
-        <div>${id&&!ro?`<input type="file" accept="image/*" id="wphotoInput"><div class="small muted">profile photo</div>`:''}${!id?'<div class="small muted">Save the worker first, then add photo & documents.</div>':''}</div>
+        <div>${id&&!ro?`<input type="file" accept="image/*" id="wphotoInput"><div class="small muted">passport-size photo</div>`:''}${!id?'<div class="small muted">Save the worker first, then add photo & documents.</div>':''}</div>
       </div></div>
       <div class="card"><h3>Personal</h3><div class="grid g3">
         ${F('Roll No (SL)','f_roll_no',w.roll_no,dis)}${F('Full name *','f_name',w.name,dis)}${F("Father's name",'f_father_name',w.father_name,dis)}
@@ -1134,18 +1303,36 @@ ROUTES.workers = async function () {
       <div class="card"><h3>Emergency contact</h3><div class="grid g3">
         ${F('Name','f_emergency_name',w.emergency_name,dis)}${F('Phone','f_emergency_phone',w.emergency_phone,dis)}${F('Relation','f_emergency_relation',w.emergency_relation,dis)}
       </div></div>
-      ${id?`<div class="card"><h3>Documents <span class="muted small">(Aadhaar, passbook, photo ID…)</span></h3>
+      ${id?`<div class="card"><h3>Onboarding documents <span class="muted small">(image or PDF — Aadhaar, PAN, passbook / cheque)</span></h3>
+        <div id="wslots" class="grid g3" style="gap:12px"></div>
+        <h4 style="margin:16px 0 6px">Other documents</h4>
         <div id="wdocs" class="inline" style="gap:10px;flex-wrap:wrap"></div>
-        ${!ro?`<div class="inline" style="margin-top:10px"><input id="wdocType" placeholder="Doc type (e.g. Aadhaar)" style="max-width:170px"><label class="small" style="margin:0">Expiry</label><input type="date" id="wdocExpiry" style="width:auto"><input type="file" accept="image/*" id="wdocInput"></div>`:''}</div>`:''}
+        ${!ro?`<div class="inline" style="margin-top:10px"><input id="wdocType" placeholder="Doc label (e.g. Driving licence)" style="max-width:200px"><label class="small" style="margin:0">Expiry</label><input type="date" id="wdocExpiry" style="width:auto"><button class="btn ghost sm" id="wdocAdd">＋ Add other</button></div>`:''}
+        <input type="file" accept="image/*,application/pdf" id="wdocFile" style="display:none"></div>
+       <div id="woffer"></div>`:''}
       ${!ro?`<div class="btn-row" style="margin-bottom:20px"><button class="btn primary" id="wsave">${id?'Save changes':'Create worker'}</button></div>`:''}`;
     $('#wback').addEventListener('click', showList);
-    if (id) renderDocs(w);
+    if (id) { renderDocs(w); renderBanner(w); }
     const pi = $('#wphotoInput');
     if (pi) pi.addEventListener('change', async () => { const f=pi.files[0]; if(!f) return;
       try { const dataUrl=await resizeImage(f,640,0.8); const r=await api('/workers/'+id+'/photo',{method:'POST',body:{dataUrl}}); $('#wphoto').innerHTML=`<img src="${r.url}" style="width:100%;height:100%;object-fit:cover">`; toast('Photo updated','ok'); } catch(e){ toast(e.message,'bad'); } pi.value=''; });
-    const di = $('#wdocInput');
-    if (di) di.addEventListener('change', async () => { const f=di.files[0]; if(!f) return;
-      try { const dataUrl=await resizeImage(f,1280,0.7); await api('/workers/'+id+'/documents',{method:'POST',body:{dataUrl,doc_type:$('#wdocType').value||'Document',expiry_date:($('#wdocExpiry')||{}).value||''}}); renderDocs((await api('/workers/'+id)).worker); toast('Document added','ok'); } catch(e){ toast(e.message,'bad'); } di.value=''; });
+    let currentSlot = 'OTHER';
+    const fileInput = $('#wdocFile');
+    const uploadDoc = (slot) => { currentSlot = slot; if (fileInput) fileInput.click(); };
+    if (fileInput) fileInput.addEventListener('change', async () => {
+      const f = fileInput.files[0]; if (!f) return;
+      const body = { doc_slot: currentSlot };
+      if (currentSlot === 'OTHER') { body.doc_type = ($('#wdocType')||{}).value || 'Document'; body.expiry_date = ($('#wdocExpiry')||{}).value || ''; }
+      try {
+        body.dataUrl = await fileToUpload(f);
+        await api('/workers/'+id+'/documents',{method:'POST',body});
+        const wk = (await api('/workers/'+id)).worker; renderDocs(wk); renderBanner(wk);
+        if (currentSlot === 'OTHER' && $('#wdocType')) $('#wdocType').value = '';
+        toast('Document added','ok');
+      } catch(e){ toast(e.message,'bad'); }
+      fileInput.value = '';
+    });
+    const addOther = $('#wdocAdd'); if (addOther) addOther.addEventListener('click', () => uploadDoc('OTHER'));
     const sb = $('#wsave');
     if (sb) sb.addEventListener('click', async () => {
       const body = {};
@@ -1156,14 +1343,139 @@ ROUTES.workers = async function () {
             else { const r=await api('/workers',{method:'POST',body}); toast('Worker created','ok'); showForm(r.id); } }
       catch(e){ toast(e.message,'bad'); }
     });
+    const SLOTS = [['AADHAAR','Aadhaar card'],['PAN','PAN card'],['PASSBOOK','Passbook / cheque']];
     function renderDocs(wk) {
-      const el=$('#wdocs'); if(!el) return; const docs=wk.documents||[];
-      el.innerHTML = docs.length?'':'<span class="muted small">No documents.</span>';
+      const docs = wk.documents || [];
       const todayISO = new Date().toISOString().slice(0,10);
-      docs.forEach(d => { const exp=d.expiry_date?`<div class="small ${d.expiry_date<todayISO?'flag':'muted'}">exp ${esc(d.expiry_date)}${d.expiry_date<todayISO?' ⚠':''}</div>`:''; const c=h(`<div style="text-align:center"><a href="${d.url}" target="_blank"><img src="${d.url}" style="width:90px;height:90px;object-fit:cover;border-radius:8px;border:1px solid var(--line)"></a><div class="small muted">${esc(d.doc_type||'')}</div>${exp}${!ro?`<button class="btn ghost sm" data-dd="${d.id}">✕</button>`:''}</div>`);
-        const x=c.querySelector('[data-dd]'); if(x) x.addEventListener('click', async()=>{ try{ await api('/worker-documents/'+d.id,{method:'DELETE'}); renderDocs((await api('/workers/'+id)).worker);}catch(e){toast(e.message,'bad');} });
-        el.appendChild(c); });
+      const slotsEl = $('#wslots');
+      if (slotsEl) {
+        slotsEl.innerHTML = '';
+        SLOTS.forEach(([slot,label]) => {
+          const d = docs.find(x => x.doc_slot === slot);
+          const tile = h(`<div class="slot ${d?'ok':'miss'}">
+            <div class="slot-h">${esc(label)} ${d?'<span class="pill ok">✓</span>':'<span class="pill bad">missing</span>'}</div>
+            <div class="inline" style="gap:6px;margin-top:6px">
+              ${d?`<a href="${d.url}" target="_blank" class="btn ghost sm">${d.is_pdf?'📄 PDF':'🖼 View'}</a>`:''}
+              ${!ro?`<button class="btn ${d?'ghost':'primary'} sm" data-up="${slot}">${d?'Replace':'Upload'}</button>`:(d?'':'<span class="muted small">—</span>')}
+            </div></div>`);
+          const b = tile.querySelector('[data-up]'); if (b) b.addEventListener('click', () => uploadDoc(slot));
+          slotsEl.appendChild(tile);
+        });
+      }
+      const el = $('#wdocs'); if (!el) return;
+      const others = docs.filter(d => !['AADHAAR','PAN','PASSBOOK'].includes(d.doc_slot));
+      el.innerHTML = others.length ? '' : '<span class="muted small">No other documents.</span>';
+      others.forEach(d => {
+        const exp = d.expiry_date ? `<div class="small ${d.expiry_date<todayISO?'flag':'muted'}">exp ${esc(d.expiry_date)}${d.expiry_date<todayISO?' ⚠':''}</div>` : '';
+        const thumb = d.is_pdf
+          ? `<div style="width:90px;height:90px;display:flex;align-items:center;justify-content:center;border-radius:8px;border:1px solid var(--line);font-size:30px">📄</div>`
+          : `<img src="${d.url}" style="width:90px;height:90px;object-fit:cover;border-radius:8px;border:1px solid var(--line)">`;
+        const c = h(`<div style="text-align:center"><a href="${d.url}" target="_blank">${thumb}</a><div class="small muted">${esc(d.doc_type||'')}</div>${exp}${!ro?`<button class="btn ghost sm" data-dd="${d.id}">✕</button>`:''}</div>`);
+        const x = c.querySelector('[data-dd]'); if (x) x.addEventListener('click', async () => { try { await api('/worker-documents/'+d.id,{method:'DELETE'}); const nw=(await api('/workers/'+id)).worker; renderDocs(nw); renderBanner(nw); } catch(e){ toast(e.message,'bad'); } });
+        el.appendChild(c);
+      });
     }
+
+    function renderBanner(wk) {
+      const el = $('#wbanner'); if (!el) return;
+      const st = wk.onboard_status || 'APPROVED';
+      const meta = {
+        DRAFT:   ['Draft',               '#64748b', 'Complete the profile, passport photo and the required documents, then submit for HQ approval.'],
+        PENDING: ['Pending HQ approval',  '#b45309', 'Submitted'+(wk.submitted_at?' on '+wk.submitted_at.slice(0,10):'')+' — awaiting HQ decision.'],
+        APPROVED:['Approved',             '#15803d', 'Approved'+(wk.approved_at?' on '+wk.approved_at.slice(0,10):'')+'. An offer letter can now be generated.'],
+        REJECTED:['Rejected',             '#b91c1c', (wk.approval_remarks?('Reason: '+wk.approval_remarks+'. '):'')+'Fix the issues and resubmit.'],
+      }[st] || ['—','#64748b',''];
+      const canSubmit = ['OPERATOR','ADMIN'].includes(State.user.role);
+      const canDecide = ['HQ','ADMIN'].includes(State.user.role);
+      let actions = '';
+      if ((st==='DRAFT'||st==='REJECTED') && canSubmit) actions += `<button class="btn primary sm" id="obSubmit">Submit for approval</button>`;
+      if (st==='PENDING' && canDecide) actions += `<button class="btn primary sm" id="obApprove">Approve</button><button class="btn ghost sm" id="obReject">Reject</button>`;
+      el.innerHTML = `<div class="card" style="border-left:4px solid ${meta[1]}">
+        <div class="inline" style="justify-content:space-between;gap:12px;flex-wrap:wrap">
+          <div><b style="color:${meta[1]}">Onboarding · ${meta[0]}</b><div class="small muted">${esc(meta[2])}</div></div>
+          <div class="btn-row" style="margin:0">${actions}</div></div></div>`;
+      const reload = async () => { const nw=(await api('/workers/'+id)).worker; renderBanner(nw); renderOffer(nw); refreshBadges(); };
+      const sb=$('#obSubmit'); if(sb) sb.addEventListener('click', async()=>{ try{ await api('/workers/'+id+'/submit',{method:'POST'}); toast('Submitted for HQ approval','ok'); reload(); }catch(e){ toast(e.message,'bad'); } });
+      const ab=$('#obApprove'); if(ab) ab.addEventListener('click', async()=>{ if(!confirm('Approve this employee for onboarding?')) return; try{ await api('/workers/'+id+'/approve',{method:'POST',body:{remarks:''}}); toast('Approved','ok'); reload(); }catch(e){ toast(e.message,'bad'); } });
+      const rb=$('#obReject'); if(rb) rb.addEventListener('click', async()=>{ const remarks=prompt('Reason for rejection (optional):')||''; try{ await api('/workers/'+id+'/reject',{method:'POST',body:{remarks}}); toast('Rejected','ok'); reload(); }catch(e){ toast(e.message,'bad'); } });
+      renderOffer(wk);
+    }
+
+    function renderOffer(wk) {
+      const el = $('#woffer'); if (!el) return;
+      if ((wk.onboard_status||'') !== 'APPROVED') { el.innerHTML = ''; return; }
+      const canOffer = ['HQ','ADMIN'].includes(State.user.role);
+      el.innerHTML = `<div class="card"><h3>Offer letter</h3>
+        ${wk.offer_letter_url
+          ? `<div class="inline" style="gap:10px"><a href="${wk.offer_letter_url}" target="_blank" class="btn ghost sm">📄 View current offer letter</a><span class="small muted">${wk.offer_letter_at?'generated '+wk.offer_letter_at.slice(0,10):''}</span></div>`
+          : '<div class="small muted">No offer letter generated yet.</div>'}
+        ${canOffer?`<div class="btn-row" style="margin-top:10px"><button class="btn primary sm" id="obOffer">${wk.offer_letter_url?'Regenerate':'Generate'} offer letter</button></div>`:''}</div>`;
+      const ob=$('#obOffer'); if(ob) ob.addEventListener('click', () => offerModal(wk));
+    }
+
+    function offerModal(wk) {
+      const isDaily = wk.wage_type === 'DAILY';
+      const ov = h(`<div class="modal-backdrop"><div class="modal" style="max-width:480px">
+        <h3>Generate offer letter</h3>
+        <div class="muted small" style="margin-bottom:8px">Pre-filled from the employee record — edit before generating if needed.</div>
+        <div class="field"><label>Designation</label><input id="of_designation" value="${esc(wk.designation||'')}"></div>
+        <div class="field"><label>Department</label><input id="of_department" value="${esc(wk.department||'')}"></div>
+        <div class="grid g2"><div class="field"><label>Date of joining</label><input type="date" id="of_doj" value="${esc(wk.date_of_joining||'')}"></div>
+          <div class="field"><label>Letter date</label><input type="date" id="of_date" value="${todayStr()}"></div></div>
+        ${isDaily
+          ? `<div class="field"><label>Daily wage (₹)</label><input type="number" id="of_daily" value="${wk.daily_wage||0}"></div>`
+          : `<div class="grid g3"><div class="field"><label>Basic (₹)</label><input type="number" id="of_basic" value="${wk.basic||0}"></div>
+              <div class="field"><label>HRA (₹)</label><input type="number" id="of_hra" value="${wk.hra||0}"></div>
+              <div class="field"><label>Allowances (₹)</label><input type="number" id="of_allow" value="${wk.allowances||0}"></div></div>
+             <div class="field"><label>Monthly gross (₹)</label><input type="number" id="of_gross" value="${wk.monthly_gross||0}"></div>`}
+        <div class="btn-row" style="justify-content:flex-end;margin-top:4px">
+          <button class="btn ghost" id="of_cancel">Cancel</button>
+          <button class="btn primary" id="of_gen">Generate PDF</button></div>
+      </div></div>`);
+      document.body.appendChild(ov);
+      const close=()=>ov.remove();
+      ov.querySelector('#of_cancel').addEventListener('click', close);
+      ov.addEventListener('click', e => { if (e.target === ov) close(); });
+      ov.querySelector('#of_gen').addEventListener('click', async () => {
+        const body = { designation:$('#of_designation').value, department:$('#of_department').value, date_of_joining:$('#of_doj').value, letter_date:$('#of_date').value };
+        if (isDaily) body.daily_wage = $('#of_daily').value;
+        else { body.basic=$('#of_basic').value; body.hra=$('#of_hra').value; body.allowances=$('#of_allow').value; body.monthly_gross=$('#of_gross').value; }
+        try { const r=await api('/workers/'+id+'/offer-letter',{method:'POST',body}); toast('Offer letter generated','ok'); close(); window.open(r.url,'_blank'); const nw=(await api('/workers/'+id)).worker; renderOffer(nw); renderBanner(nw); }
+        catch(e){ toast(e.message,'bad'); }
+      });
+    }
+  }
+};
+
+ROUTES.onboarding = async function () {
+  const v = $('#view');
+  const canDecide = ['HQ','ADMIN'].includes(State.user.role);
+  let tab = 'PENDING';
+  render();
+  function render() {
+    const tabs = { PENDING:'Pending approval', DRAFT:'Drafts', APPROVED:'Approved', REJECTED:'Rejected' };
+    v.innerHTML = topbar('Employee Onboarding', 'Track new hires from draft through HQ approval and offer letter.') +
+      `<div class="card noprint"><div class="btn-row">
+        ${Object.keys(tabs).map(s=>`<button class="btn ${tab===s?'primary':'ghost'}" data-tab="${s}">${tabs[s]}</button>`).join('')}
+      </div></div><div id="obList"><div class="empty">Loading…</div></div>`;
+    v.querySelectorAll('[data-tab]').forEach(b=>b.addEventListener('click',()=>{ tab=b.dataset.tab; render(); }));
+    load();
+  }
+  async function load() {
+    const r = await api('/workers?onboard='+tab);
+    if (!r.workers.length) { $('#obList').innerHTML = `<div class="card empty">No employees in this stage.</div>`; return; }
+    const rows = r.workers.map(w=>`<tr>
+      <td>${esc(w.name)}<div class="small muted">${esc(w.roll_no||'')}</div></td>
+      <td>${esc(w.department||'—')}<div class="small muted">${esc(w.designation||'')}</div></td>
+      <td class="small">${w.wage_type==='DAILY'?('₹'+fmt(w.daily_wage)+'/day'):('₹'+fmt(w.monthly_gross)+'/mo')}</td>
+      <td>${w.has_offer?'<span class="pill ok">Offer ✓</span>':'<span class="muted small">—</span>'}</td>
+      <td class="right"><div class="btn-row" style="justify-content:flex-end;margin:0">
+        ${(tab==='PENDING'&&canDecide)?`<button class="btn primary sm" data-ap="${w.id}">Approve</button><button class="btn ghost sm" data-rj="${w.id}">Reject</button>`:''}
+        <button class="btn ghost sm" data-open="${w.id}">Open</button></div></td></tr>`).join('');
+    $('#obList').innerHTML = `<div class="card"><table><thead><tr><th>Employee</th><th>Dept / role</th><th>Wage</th><th>Offer</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`;
+    $('#obList').querySelectorAll('[data-open]').forEach(b=>b.addEventListener('click',()=>{ State.openWorker=b.dataset.open; State.route='workers'; renderApp(); }));
+    $('#obList').querySelectorAll('[data-ap]').forEach(b=>b.addEventListener('click',async()=>{ if(!confirm('Approve this employee?')) return; try{ await api('/workers/'+b.dataset.ap+'/approve',{method:'POST',body:{remarks:''}}); toast('Approved','ok'); load(); refreshBadges(); }catch(e){ toast(e.message,'bad'); } }));
+    $('#obList').querySelectorAll('[data-rj]').forEach(b=>b.addEventListener('click',async()=>{ const remarks=prompt('Reason for rejection (optional):')||''; try{ await api('/workers/'+b.dataset.rj+'/reject',{method:'POST',body:{remarks}}); toast('Rejected','ok'); load(); refreshBadges(); }catch(e){ toast(e.message,'bad'); } }));
   }
 };
 

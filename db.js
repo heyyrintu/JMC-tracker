@@ -8,6 +8,7 @@ const path = require('path');
 const { DatabaseSync } = require('node:sqlite'); // built-in, no native build required (Node >= 22.5)
 const bcrypt = require('bcryptjs');
 const config = require('./config');
+const pdiSeed = require('./pdi-parts');
 
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'data.sqlite');
 const db = new DatabaseSync(DB_PATH);
@@ -94,11 +95,38 @@ function init() {
   );
 
   -- QC / PTL / PDI: parts checked + manpower. MG flag computed in app.
+  -- parts_qty is kept as the daily rollup (= SUM of qc_lines.checked_qty when
+  -- detailed lines exist) so existing billing / MG / MIS logic is unchanged.
   CREATE TABLE IF NOT EXISTS qc (
     entry_id INTEGER PRIMARY KEY,
     parts_qty INTEGER NOT NULL DEFAULT 0,
     manpower_count INTEGER NOT NULL DEFAULT 0,
     FOREIGN KEY (entry_id) REFERENCES daily_entries(id) ON DELETE CASCADE
+  );
+
+  -- Per-part QC inspection lines: checked / rejected / rework + defect type.
+  -- PPM and first-pass yield are derived from these (rejected / checked).
+  CREATE TABLE IF NOT EXISTS qc_lines (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    entry_id INTEGER NOT NULL,
+    part_no TEXT,
+    checked_qty INTEGER NOT NULL DEFAULT 0,
+    rejected_qty INTEGER NOT NULL DEFAULT 0,
+    rework_qty INTEGER NOT NULL DEFAULT 0,
+    defect_type TEXT,
+    remarks TEXT,
+    FOREIGN KEY (entry_id) REFERENCES daily_entries(id) ON DELETE CASCADE
+  );
+
+  -- PDI parts master (imported from the JMC parts sheet). Used to suggest /
+  -- standardise the part numbers entered on QC inspection lines.
+  CREATE TABLE IF NOT EXISTS pdi_parts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    part_no TEXT NOT NULL UNIQUE,
+    category TEXT NOT NULL DEFAULT 'OTHER',   -- CHASSIS | BUS_BODY | OTHER
+    description TEXT,
+    active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
 
   -- Individual transport trips (from / to / vehicle / timestamp).
@@ -262,6 +290,23 @@ function init() {
   // Additive migrations (safe to run repeatedly; ignore "duplicate column").
   try { db.exec('ALTER TABLE daily_entries ADD COLUMN ppm INTEGER'); } catch (_) {}
   try { db.exec('ALTER TABLE worker_documents ADD COLUMN expiry_date TEXT'); } catch (_) {}
+  try { db.exec('ALTER TABLE worker_documents ADD COLUMN doc_slot TEXT'); } catch (_) {}
+  // Link a discrepancy back to the QC day it was raised from (QC -> concern log).
+  try { db.exec('ALTER TABLE discrepancies ADD COLUMN qc_entry_id INTEGER'); } catch (_) {}
+  // Employee onboarding workflow: DRAFT -> PENDING -> APPROVED/REJECTED, then
+  // an offer letter may be generated. Existing workers default to APPROVED so
+  // they keep appearing in attendance/payroll rosters unchanged.
+  for (const [col, def] of [
+    ['onboard_status',   "TEXT NOT NULL DEFAULT 'APPROVED'"],
+    ['submitted_by',     'INTEGER'],
+    ['submitted_at',     'TEXT'],
+    ['approved_by',      'INTEGER'],
+    ['approved_at',      'TEXT'],
+    ['approval_remarks', 'TEXT'],
+    ['offer_letter_file','TEXT'],
+    ['offer_letter_at',  'TEXT'],
+    ['offer_terms',      'TEXT'],   // JSON snapshot of the generated letter
+  ]) { try { db.exec(`ALTER TABLE workers ADD COLUMN ${col} ${def}`); } catch (_) {} }
 
   // Indexes for the hot filter/join paths (SQLite does not auto-index foreign
   // keys). Created after the ALTERs so expiry_date exists. Safe to re-run.
@@ -277,6 +322,9 @@ function init() {
     CREATE INDEX IF NOT EXISTS idx_wdocs_expiry      ON worker_documents(expiry_date);
     CREATE INDEX IF NOT EXISTS idx_leave_worker      ON leave_applications(worker_id);
     CREATE INDEX IF NOT EXISTS idx_sessions_user     ON sessions(user_id);
+    CREATE INDEX IF NOT EXISTS idx_workers_onboard   ON workers(onboard_status);
+    CREATE INDEX IF NOT EXISTS idx_qclines_entry     ON qc_lines(entry_id);
+    CREATE INDEX IF NOT EXISTS idx_pdiparts_active   ON pdi_parts(active);
   `);
 }
 
@@ -301,6 +349,16 @@ function seed() {
   if (getSetting('costs') === null) setSetting('costs', config.COSTS);
   if (getSetting('invoice') === null) setSetting('invoice', config.INVOICE);
   if (getSetting('ppm_target') === null) setSetting('ppm_target', config.PPM_TARGET);
+  if (getSetting('defect_types') === null) setSetting('defect_types', config.DEFECT_TYPES);
+  // PDI parts master — load the imported sheet once (idempotent on re-seed).
+  if (db.prepare('SELECT COUNT(*) c FROM pdi_parts').get().c === 0) {
+    const ins = db.prepare('INSERT OR IGNORE INTO pdi_parts (part_no, category) VALUES (?, ?)');
+    const tx = db.transaction(() => {
+      pdiSeed.CHASSIS.forEach(p => ins.run(p, 'CHASSIS'));
+      pdiSeed.BUS_BODY.forEach(p => ins.run(p, 'BUS_BODY'));
+    });
+    tx();
+  }
   if (getSetting('mg_billing') === null) setSetting('mg_billing', config.MG_BILLING);
   if (getSetting('leave_policy') === null) setSetting('leave_policy', config.LEAVE_POLICY);
 

@@ -62,6 +62,11 @@ module.exports = {
   // ---- PPM (production / quality number; lower is better) ------------------
   PPM_TARGET: 500,
 
+  // ---- QC / PDI defect taxonomy -------------------------------------------
+  // Categories an inspector tags a rejected part with. Drives the defect
+  // Pareto in MIS. Editable later by an ADMIN (setting key 'defect_types').
+  DEFECT_TYPES: ['DENT', 'SCRATCH', 'DIMENSION', 'MISSING_PART', 'WRONG_PART', 'QR_ISSUE', 'PAINT', 'BURR', 'OTHER'],
+
   // ---- Costs (monthly, INR) for internal P&L ------------------------------
   // transport_monthly = 0 means treat transport as pass-through (cost = transport revenue).
   COSTS: { manpower_monthly: 163000, overhead_monthly: 77000, transport_monthly: 0 },
@@ -70,6 +75,21 @@ module.exports = {
   INVOICE: { gst_pct: 0, gstin: '', bill_to: 'JMC Works Pvt. Ltd.', notes: 'Subject to 3-month review per LOI.' },
   // Bill QC at the guaranteed minimum (max of actual vs MG) per operating day.
   MG_BILLING: true,
+
+  // ---- Offer letter (generated after HQ approval) -------------------------
+  // Editable by an ADMIN later from Settings (stored under setting key 'offer').
+  OFFER: {
+    company: 'Drona Logitech Private Limited',
+    address: 'Drona ValueChain — Operations Office',
+    city: 'Pant Nagar, Uttarakhand',
+    email: '',
+    phone: '',
+    signatory_name: 'Authorised Signatory',
+    signatory_title: 'HR & Operations, Drona ValueChain',
+    probation_months: 3,
+    notice_days: 30,
+    notes: 'This offer is contingent on satisfactory verification of the documents submitted at onboarding. Employment is governed by the company’s standard terms of service.',
+  },
 
   // ---- Roles --------------------------------------------------------------
   ROLES: {

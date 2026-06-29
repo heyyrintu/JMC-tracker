@@ -8,6 +8,7 @@ const crypto = require('crypto');
 const express = require('express');
 const cookieParser = require('cookie-parser');
 const bcrypt = require('bcryptjs');
+const PDFDocument = require('pdfkit');
 const { db, getSetting, setSetting, seed } = require('./db');
 const config = require('./config');
 const calc = require('./calc');
@@ -50,7 +51,7 @@ app.use((req, res, next) => {
   next();
 });
 
-app.use(express.json({ limit: '12mb' })); // room for base64 photos (client pre-resizes)
+app.use(express.json({ limit: '20mb' })); // room for base64 photos + PDF documents (client pre-resizes images)
 app.use(cookieParser());
 // Uploaded files contain operational proof photos AND worker PII (ID / bank
 // documents). They must never be world-readable: require a valid session, and
@@ -60,7 +61,7 @@ app.get('/uploads/:file', auth, (req, res) => {
   const file = path.basename(String(req.params.file || '')); // strip any traversal
   const full = path.join(UPLOAD_DIR, file);
   if (path.dirname(full) !== UPLOAD_DIR) return res.status(400).json({ error: 'Bad path' });
-  if (/^w(doc|photo)_/.test(file) && !DRONA_HR.includes(req.user.role))
+  if (/^(w(doc|photo)|offer)_/.test(file) && !DRONA_HR.includes(req.user.role))
     return res.status(403).json({ error: 'Not permitted' });
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.sendFile(full, (err) => { if (err && !res.headersSent) res.status(404).json({ error: 'Not found' }); });
@@ -183,6 +184,7 @@ function clientConfig(user) {
     locations: config.COMMON_LOCATIONS,
     workingDays: config.WORKING_DAYS_PER_MONTH,
     ppmTarget: getSetting('ppm_target', config.PPM_TARGET),
+    defectTypes: getSetting('defect_types', config.DEFECT_TYPES),
     mgBilling: !!getSetting('mg_billing', config.MG_BILLING),
     leaveTypes: config.LEAVE_TYPES,
     leavePolicy: getSetting('leave_policy', config.LEAVE_POLICY),
@@ -216,6 +218,17 @@ function loadEntry(id) {
               || { truck_count: 0, weight_ton: 0, manpower_count: 0 };
   e.qc = db.prepare('SELECT parts_qty, manpower_count FROM qc WHERE entry_id = ?').get(id)
               || { parts_qty: 0, manpower_count: 0 };
+  e.qc.lines = db.prepare('SELECT id, part_no, checked_qty, rejected_qty, rework_qty, defect_type, remarks FROM qc_lines WHERE entry_id = ? ORDER BY id').all(id);
+  // Derived quality metrics from the per-part lines (rejected / checked).
+  const qcAgg = e.qc.lines.reduce((a, l) => {
+    a.checked += l.checked_qty; a.rejected += l.rejected_qty; a.rework += l.rework_qty; return a;
+  }, { checked: 0, rejected: 0, rework: 0 });
+  e.qc.checked = qcAgg.checked;
+  e.qc.rejected = qcAgg.rejected;
+  e.qc.rework = qcAgg.rework;
+  e.qc.passed = Math.max(0, qcAgg.checked - qcAgg.rejected - qcAgg.rework);
+  e.qc.ppm_derived = qcAgg.checked > 0 ? Math.round((qcAgg.rejected / qcAgg.checked) * 1e6) : null;
+  e.qc.fpy = qcAgg.checked > 0 ? +(((qcAgg.checked - qcAgg.rejected - qcAgg.rework) / qcAgg.checked) * 100).toFixed(1) : null;
   e.transport = db.prepare('SELECT id, from_loc, to_loc, vehicle_type, trip_time, remarks FROM transport_trips WHERE entry_id = ? ORDER BY trip_time').all(id);
   e.attachments = db.prepare(`SELECT a.id, a.filename, a.caption, a.created_at, u.name AS uploaded_by_name
     FROM attachments a LEFT JOIN users u ON u.id = a.uploaded_by WHERE a.entry_id = ? ORDER BY a.id`).all(id)
@@ -305,12 +318,28 @@ app.post('/api/entries', auth, requireRole('OPERATOR', 'ADMIN'), (req, res) => {
                 weight_ton=excluded.weight_ton, manpower_count=excluded.manpower_count`)
       .run(entryId, +U.truck_count||0, +U.weight_ton||0, +U.manpower_count||0);
 
-    // QC
+    // QC — per-part inspection lines roll up into the qc daily total.
     const Q = b.qc || {};
+    db.prepare('DELETE FROM qc_lines WHERE entry_id = ?').run(entryId);
+    const qlIns = db.prepare(`INSERT INTO qc_lines (entry_id, part_no, checked_qty, rejected_qty, rework_qty, defect_type, remarks)
+                              VALUES (?,?,?,?,?,?,?)`);
+    let qcChecked = 0, qcRejected = 0, qcInserted = 0;
+    for (const ln of (Array.isArray(Q.lines) ? Q.lines : [])) {
+      const chk = +ln.checked_qty || 0, rej = +ln.rejected_qty || 0, rw = +ln.rework_qty || 0;
+      if (chk === 0 && rej === 0 && rw === 0 && !ln.part_no) continue; // skip blank rows
+      qcChecked += chk; qcRejected += rej; qcInserted++;
+      qlIns.run(entryId, ln.part_no || null, chk, rej, rw, ln.defect_type || null, ln.remarks || null);
+    }
+    // With detailed lines, parts_qty = total checked; otherwise the single field.
+    const qcParts = qcInserted ? qcChecked : (+Q.parts_qty || 0);
     db.prepare(`INSERT INTO qc (entry_id, parts_qty, manpower_count) VALUES (?,?,?)
                 ON CONFLICT(entry_id) DO UPDATE SET parts_qty=excluded.parts_qty,
                 manpower_count=excluded.manpower_count`)
-      .run(entryId, +Q.parts_qty||0, +Q.manpower_count||0);
+      .run(entryId, qcParts, +Q.manpower_count||0);
+    // Auto-derive PPM from defects when inspection lines exist (overrides manual).
+    if (qcInserted && qcChecked > 0) {
+      db.prepare('UPDATE daily_entries SET ppm = ? WHERE id = ?').run(Math.round((qcRejected / qcChecked) * 1e6), entryId);
+    }
 
     // Transport
     db.prepare('DELETE FROM transport_trips WHERE entry_id = ?').run(entryId);
@@ -399,12 +428,13 @@ app.post('/api/discrepancies', auth, requireRole('OPERATOR', 'JMC_APPROVER', 'AD
   if (!types.includes(b.type)) return res.status(400).json({ error: 'Invalid type' });
   const sev = ['LOW','MEDIUM','HIGH'].includes(b.severity) ? b.severity : 'MEDIUM';
   const info = db.prepare(`INSERT INTO discrepancies
-    (disc_date, type, part_no, description, qty_dispatched, qty_billed, qr_code, severity, raised_by, raised_company)
-    VALUES (?,?,?,?,?,?,?,?,?,?)`)
+    (disc_date, type, part_no, description, qty_dispatched, qty_billed, qr_code, severity, raised_by, raised_company, qc_entry_id)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
     .run(b.disc_date || new Date().toISOString().slice(0,10), b.type, b.part_no || null, b.description || null,
       b.qty_dispatched != null && b.qty_dispatched !== '' ? Number(b.qty_dispatched) : null,
       b.qty_billed != null && b.qty_billed !== '' ? Number(b.qty_billed) : null,
-      b.qr_code || null, sev, req.user.id, req.user.company);
+      b.qr_code || null, sev, req.user.id, req.user.company,
+      b.qc_entry_id != null && b.qc_entry_id !== '' ? Number(b.qc_entry_id) : null);
   audit(req.user.id, 'DISC_RAISE', { id: info.lastInsertRowid, type: b.type });
   res.json({ discrepancy: loadDisc(info.lastInsertRowid) });
 });
@@ -506,6 +536,7 @@ app.get('/api/summary', auth, (req, res) => {
     pending_mp_requests: db.prepare("SELECT COUNT(*) c FROM manpower_requests WHERE status='PENDING'").get().c,
     open_discrepancies: db.prepare("SELECT COUNT(*) c FROM discrepancies WHERE status='OPEN'").get().c,
     pending_leaves: db.prepare("SELECT COUNT(*) c FROM leave_applications WHERE status='PENDING'").get().c,
+    pending_onboarding: db.prepare("SELECT COUNT(*) c FROM workers WHERE onboard_status='PENDING'").get().c,
     expiring_docs: db.prepare("SELECT COUNT(*) c FROM worker_documents WHERE expiry_date IS NOT NULL AND expiry_date <= date('now','+45 days')").get().c });
 });
 
@@ -635,8 +666,24 @@ app.get('/api/mis', auth, (req, res) => {
   const utilization = approvedTotal ? Math.round((avgMpPerDay / approvedTotal) * 100) : 0;
   const mgAchievement = qcDays ? Math.round((totals.mg_met_days / qcDays) * 100) : 0;
 
+  // QC quality — derived from per-part inspection lines this month.
+  const qcQ = db.prepare(`SELECT COALESCE(SUM(checked_qty),0) checked, COALESCE(SUM(rejected_qty),0) rejected, COALESCE(SUM(rework_qty),0) rework
+    FROM qc_lines ql JOIN daily_entries e ON e.id = ql.entry_id WHERE substr(e.work_date,1,7) = ?`).get(month);
+  const defectPareto = db.prepare(`SELECT COALESCE(defect_type,'OTHER') defect_type, SUM(rejected_qty) qty
+    FROM qc_lines ql JOIN daily_entries e ON e.id = ql.entry_id
+    WHERE substr(e.work_date,1,7) = ? AND rejected_qty > 0
+    GROUP BY COALESCE(defect_type,'OTHER') ORDER BY qty DESC`).all(month);
+  const qcQuality = {
+    checked: qcQ.checked, rejected: qcQ.rejected, rework: qcQ.rework,
+    passed: Math.max(0, qcQ.checked - qcQ.rejected - qcQ.rework),
+    rejection_rate: qcQ.checked ? +((qcQ.rejected / qcQ.checked) * 100).toFixed(2) : 0,
+    fpy: qcQ.checked ? +(((qcQ.checked - qcQ.rejected - qcQ.rework) / qcQ.checked) * 100).toFixed(1) : null,
+    ppm_derived: qcQ.checked ? Math.round((qcQ.rejected / qcQ.checked) * 1e6) : null,
+  };
+
   res.json({ month, mgTarget, ppmTarget, ppmAvg, approved, approvedTotal, days, mpCat, discByType, discBySev, discTot,
-    trByVehicle, trByRoute, mpReq, totals, opDays, qcDays, avgMpPerDay, utilization, mgAchievement });
+    trByVehicle, trByRoute, mpReq, totals, opDays, qcDays, avgMpPerDay, utilization, mgAchievement,
+    qcQuality, defectPareto });
 });
 
 // ---- Admin: settings + users ---------------------------------------------
@@ -707,16 +754,17 @@ const DRONA_HR = ['OPERATOR', 'HQ', 'ADMIN'];
 const MASK_FIELDS = ['aadhaar', 'pan', 'uan', 'esic_no', 'account_no', 'ifsc'];
 
 function workerDocs(id) {
-  return db.prepare(`SELECT d.id, d.doc_type, d.filename, d.caption, d.expiry_date, d.created_at, u.name uploaded_by_name
+  return db.prepare(`SELECT d.id, d.doc_type, d.doc_slot, d.filename, d.caption, d.expiry_date, d.created_at, u.name uploaded_by_name
     FROM worker_documents d LEFT JOIN users u ON u.id = d.uploaded_by WHERE d.worker_id = ? ORDER BY d.id`).all(id)
-    .map(d => ({ ...d, url: '/uploads/' + d.filename }));
+    .map(d => ({ ...d, url: '/uploads/' + d.filename, is_pdf: /\.pdf$/i.test(d.filename) }));
 }
 
 app.get('/api/workers', auth, requireRole(...DRONA_HR), (req, res) => {
-  const { status, department, q } = req.query;
+  const { status, department, q, onboard } = req.query;
   let sql = 'SELECT * FROM workers WHERE 1=1'; const args = [];
   if (status) { sql += ' AND status = ?'; args.push(status); }
   if (department) { sql += ' AND department = ?'; args.push(department); }
+  if (onboard) { sql += ' AND onboard_status = ?'; args.push(onboard); }
   if (q) { sql += ' AND (name LIKE ? OR roll_no LIKE ? OR mobile LIKE ?)'; args.push(`%${q}%`, `%${q}%`, `%${q}%`); }
   sql += ' ORDER BY CASE status WHEN \'ACTIVE\' THEN 0 ELSE 1 END, name LIMIT 1000';
   const rows = db.prepare(sql).all(...args).map(w => ({
@@ -724,6 +772,7 @@ app.get('/api/workers', auth, requireRole(...DRONA_HR), (req, res) => {
     designation: w.designation, mobile: w.mobile, status: w.status, date_of_joining: w.date_of_joining,
     aadhaar_masked: maskTail(w.aadhaar), account_masked: maskTail(w.account_no),
     wage_type: w.wage_type, monthly_gross: w.monthly_gross, daily_wage: w.daily_wage,
+    onboard_status: w.onboard_status, has_offer: !!w.offer_letter_file,
     photo: w.photo ? '/uploads/' + w.photo : null,
   }));
   res.json({ workers: rows });
@@ -736,6 +785,7 @@ app.get('/api/workers/:id', auth, requireRole(...DRONA_HR), (req, res) => {
   const full = ['ADMIN', 'HQ', 'OPERATOR'].includes(req.user.role);
   if (!full) MASK_FIELDS.forEach(f => { w[f] = maskTail(w[f]); });
   w.photo_url = w.photo ? '/uploads/' + w.photo : null;
+  w.offer_letter_url = w.offer_letter_file ? '/uploads/' + w.offer_letter_file : null;
   w.documents = workerDocs(w.id);
   res.json({ worker: w });
 });
@@ -759,7 +809,9 @@ app.post('/api/workers', auth, requireRole('OPERATOR', 'ADMIN'), (req, res) => {
   const o = collectWorker(b);
   const cols = WORKER_FIELDS, ph = cols.map(() => '?').join(',');
   try {
-    const info = db.prepare(`INSERT INTO workers (${cols.join(',')}) VALUES (${ph})`).run(...cols.map(c => o[c]));
+    // New hires begin onboarding as DRAFT; they only join attendance/payroll
+    // rosters once HQ approves them.
+    const info = db.prepare(`INSERT INTO workers (${cols.join(',')}, onboard_status) VALUES (${ph}, 'DRAFT')`).run(...cols.map(c => o[c]));
     audit(req.user.id, 'WORKER_CREATE', { id: info.lastInsertRowid });
     res.json({ id: info.lastInsertRowid });
   } catch (e) {
@@ -797,6 +849,19 @@ function saveImage(dataUrl, prefix) {
   return { filename };
 }
 
+// Worker documents may be images OR PDFs (Aadhaar, PAN, passbook scans, etc).
+function saveDocument(dataUrl, prefix) {
+  const m = /^data:(image\/(?:png|jpeg|jpg|webp)|application\/pdf);base64,(.+)$/.exec(dataUrl || '');
+  if (!m) return null;
+  const mime = m[1];
+  const ext = mime === 'application/pdf' ? 'pdf' : (mime.split('/')[1] === 'jpeg' ? 'jpg' : mime.split('/')[1]);
+  const buf = Buffer.from(m[2], 'base64');
+  if (buf.length > 12 * 1024 * 1024) return { error: 'File too large (max 12 MB)' };
+  const filename = `${prefix}_${Date.now()}_${crypto.randomBytes(3).toString('hex')}.${ext}`;
+  fs.writeFileSync(path.join(UPLOAD_DIR, filename), buf);
+  return { filename };
+}
+
 app.post('/api/workers/:id/photo', auth, requireRole('OPERATOR', 'ADMIN'), (req, res) => {
   const w = db.prepare('SELECT * FROM workers WHERE id=?').get(Number(req.params.id));
   if (!w) return res.status(404).json({ error: 'Not found' });
@@ -807,13 +872,22 @@ app.post('/api/workers/:id/photo', auth, requireRole('OPERATOR', 'ADMIN'), (req,
   res.json({ url: '/uploads/' + r.filename });
 });
 
+const DOC_SLOTS = ['AADHAAR', 'PAN', 'PASSBOOK', 'OTHER'];
 app.post('/api/workers/:id/documents', auth, requireRole('OPERATOR', 'ADMIN'), (req, res) => {
   const w = db.prepare('SELECT id FROM workers WHERE id=?').get(Number(req.params.id));
   if (!w) return res.status(404).json({ error: 'Not found' });
-  const r = saveImage((req.body || {}).dataUrl, 'wdoc');
-  if (!r || r.error) return res.status(400).json({ error: r ? r.error : 'Invalid image' });
-  db.prepare('INSERT INTO worker_documents (worker_id, doc_type, filename, caption, expiry_date, uploaded_by) VALUES (?,?,?,?,?,?)')
-    .run(w.id, (req.body || {}).doc_type || 'Document', r.filename, (req.body || {}).caption || null, (req.body || {}).expiry_date || null, req.user.id);
+  const b = req.body || {};
+  const r = saveDocument(b.dataUrl, 'wdoc');
+  if (!r || r.error) return res.status(400).json({ error: r ? r.error : 'Only image or PDF files are accepted' });
+  const slot = DOC_SLOTS.includes(b.doc_slot) ? b.doc_slot : 'OTHER';
+  // One document per fixed slot (except OTHER) — replace any existing file.
+  if (slot !== 'OTHER') {
+    const prev = db.prepare('SELECT id, filename FROM worker_documents WHERE worker_id=? AND doc_slot=?').all(w.id, slot);
+    prev.forEach(p => { try { fs.unlinkSync(path.join(UPLOAD_DIR, p.filename)); } catch (_) {}
+      db.prepare('DELETE FROM worker_documents WHERE id=?').run(p.id); });
+  }
+  db.prepare('INSERT INTO worker_documents (worker_id, doc_type, doc_slot, filename, caption, expiry_date, uploaded_by) VALUES (?,?,?,?,?,?,?)')
+    .run(w.id, b.doc_type || slot, slot, r.filename, b.caption || null, b.expiry_date || null, req.user.id);
   res.json({ ok: true });
 });
 
@@ -825,6 +899,169 @@ app.delete('/api/worker-documents/:id', auth, requireRole('OPERATOR', 'ADMIN'), 
   res.json({ ok: true });
 });
 
+// ---- Onboarding workflow (OPERATOR submits -> HQ approves) -----------------
+const REQUIRED_DOC_SLOTS = ['AADHAAR', 'PAN', 'PASSBOOK'];
+
+// Fields/documents a candidate must have before HQ approval is requested.
+function onboardingGaps(w) {
+  const gaps = [];
+  if (!w.name) gaps.push('full name');
+  if (!w.designation) gaps.push('designation');
+  if (!w.date_of_joining) gaps.push('date of joining');
+  if (!(Number(w.monthly_gross) > 0 || Number(w.daily_wage) > 0)) gaps.push('salary');
+  if (!w.photo) gaps.push('passport photo');
+  const slots = new Set(db.prepare('SELECT doc_slot FROM worker_documents WHERE worker_id=?').all(w.id).map(d => d.doc_slot));
+  REQUIRED_DOC_SLOTS.forEach(s => { if (!slots.has(s)) gaps.push(s.charAt(0) + s.slice(1).toLowerCase() + ' document'); });
+  return gaps;
+}
+
+app.get('/api/workers/:id/onboarding-gaps', auth, requireRole(...DRONA_HR), (req, res) => {
+  const w = db.prepare('SELECT * FROM workers WHERE id=?').get(Number(req.params.id));
+  if (!w) return res.status(404).json({ error: 'Not found' });
+  res.json({ status: w.onboard_status, gaps: onboardingGaps(w) });
+});
+
+app.post('/api/workers/:id/submit', auth, requireRole('OPERATOR', 'ADMIN'), (req, res) => {
+  const w = db.prepare('SELECT * FROM workers WHERE id=?').get(Number(req.params.id));
+  if (!w) return res.status(404).json({ error: 'Not found' });
+  if (!['DRAFT', 'REJECTED'].includes(w.onboard_status))
+    return res.status(409).json({ error: 'Already submitted or approved' });
+  const gaps = onboardingGaps(w);
+  if (gaps.length) return res.status(400).json({ error: 'Incomplete — add: ' + gaps.join(', ') });
+  db.prepare("UPDATE workers SET onboard_status='PENDING', submitted_by=?, submitted_at=datetime('now') WHERE id=?")
+    .run(req.user.id, w.id);
+  audit(req.user.id, 'ONBOARD_SUBMIT', { id: w.id });
+  res.json({ ok: true });
+});
+
+function decideOnboarding(decision) {
+  return (req, res) => {
+    const w = db.prepare('SELECT * FROM workers WHERE id=?').get(Number(req.params.id));
+    if (!w) return res.status(404).json({ error: 'Not found' });
+    if (w.onboard_status !== 'PENDING') return res.status(409).json({ error: 'Not pending approval' });
+    const status = decision === 'APPROVE' ? 'APPROVED' : 'REJECTED';
+    db.prepare("UPDATE workers SET onboard_status=?, approved_by=?, approved_at=datetime('now'), approval_remarks=? WHERE id=?")
+      .run(status, req.user.id, (req.body || {}).remarks || null, w.id);
+    audit(req.user.id, 'ONBOARD_' + status, { id: w.id });
+    res.json({ ok: true });
+  };
+}
+app.post('/api/workers/:id/approve', auth, requireRole('HQ', 'ADMIN'), decideOnboarding('APPROVE'));
+app.post('/api/workers/:id/reject', auth, requireRole('HQ', 'ADMIN'), decideOnboarding('REJECT'));
+
+// ---- Offer letter (PDF, generated only after approval) ---------------------
+// pdfkit's built-in fonts are WinAnsi-encoded and lack the ₹ glyph, so money is
+// rendered with the "Rs." prefix.
+function rs(n) { return 'Rs. ' + Number(n || 0).toLocaleString('en-IN'); }
+function generateOfferLetter(filePath, t, cfg) {
+  return new Promise((resolve, reject) => {
+    const doc = new PDFDocument({ size: 'A4', margin: 56 });
+    const stream = fs.createWriteStream(filePath);
+    stream.on('finish', resolve); stream.on('error', reject); doc.on('error', reject);
+    doc.pipe(stream);
+
+    // Letterhead
+    doc.fontSize(18).font('Helvetica-Bold').text(cfg.company, { align: 'center' });
+    doc.fontSize(9).font('Helvetica').fillColor('#555')
+      .text([cfg.address, cfg.city, [cfg.email, cfg.phone].filter(Boolean).join('  ·  ')].filter(Boolean).join('\n'), { align: 'center' });
+    doc.moveDown(0.5);
+    doc.moveTo(56, doc.y).lineTo(539, doc.y).strokeColor('#cccccc').stroke();
+    doc.moveDown(1).fillColor('#000');
+
+    doc.fontSize(10).font('Helvetica').text('Date: ' + t.letter_date, { align: 'right' });
+    doc.moveDown(0.8);
+    doc.font('Helvetica-Bold').fontSize(11).text('To,');
+    doc.font('Helvetica').fontSize(10).text(t.name);
+    if (t.address) doc.text(t.address);
+    doc.moveDown(1);
+
+    doc.font('Helvetica-Bold').fontSize(12).text('Subject: Offer of Employment', { underline: true });
+    doc.moveDown(0.8);
+
+    doc.font('Helvetica').fontSize(10.5);
+    doc.text(`Dear ${t.name},`);
+    doc.moveDown(0.6);
+    doc.text(`We are pleased to offer you the position of ${t.designation || '—'}` +
+      (t.department ? ` in the ${t.department} department` : '') +
+      ` at ${cfg.company}. Your appointment is effective from ${t.date_of_joining || '—'}.`,
+      { align: 'justify' });
+    doc.moveDown(0.8);
+
+    doc.font('Helvetica-Bold').text('Compensation');
+    doc.font('Helvetica').moveDown(0.3);
+    const row = (label, val) => {
+      const y = doc.y;
+      doc.text(label, 70, y, { width: 260, continued: false });
+      doc.text(val, 330, y, { width: 200, align: 'right' });
+      doc.moveDown(0.2);
+    };
+    if (t.wage_type === 'DAILY') {
+      row('Daily wage', rs(t.daily_wage));
+    } else {
+      if (t.basic)      row('Basic', rs(t.basic) + ' / month');
+      if (t.hra)        row('House Rent Allowance', rs(t.hra) + ' / month');
+      if (t.allowances) row('Other Allowances', rs(t.allowances) + ' / month');
+      doc.font('Helvetica-Bold'); row('Gross (monthly)', rs(t.monthly_gross)); doc.font('Helvetica');
+    }
+    doc.moveDown(0.3).fontSize(9).fillColor('#555')
+      .text('Statutory deductions (PF / ESI, as applicable) will be made per prevailing law.', 70);
+    doc.fillColor('#000').fontSize(10.5).moveDown(0.8);
+
+    doc.text(`This offer carries a probation period of ${cfg.probation_months} months. After confirmation, ` +
+      `either party may terminate the engagement with ${cfg.notice_days} days’ written notice.`, { align: 'justify' });
+    doc.moveDown(0.6);
+    if (cfg.notes) doc.fontSize(9.5).fillColor('#444').text(cfg.notes, { align: 'justify' }).fillColor('#000').fontSize(10.5);
+    doc.moveDown(0.8);
+    doc.text('We look forward to welcoming you to the team.');
+    doc.moveDown(2);
+
+    doc.font('Helvetica-Bold').text(cfg.signatory_name);
+    doc.font('Helvetica').fontSize(9.5).fillColor('#555').text(cfg.signatory_title);
+    doc.fillColor('#000');
+
+    doc.moveDown(3).fontSize(9).fillColor('#777')
+      .text('_______________________________', { continued: false })
+      .text(`Accepted by ${t.name}   (Signature / Date)`);
+
+    doc.end();
+  });
+}
+
+app.post('/api/workers/:id/offer-letter', auth, requireRole('HQ', 'ADMIN'), async (req, res) => {
+  const w = db.prepare('SELECT * FROM workers WHERE id=?').get(Number(req.params.id));
+  if (!w) return res.status(404).json({ error: 'Not found' });
+  if (w.onboard_status !== 'APPROVED') return res.status(409).json({ error: 'Worker must be approved before generating an offer letter' });
+  const cfg = getSetting('offer', config.OFFER);
+  const b = req.body || {};
+  const pick = (k) => b[k] != null && b[k] !== '' ? b[k] : w[k];
+  const terms = {
+    name: w.name,
+    address: w.address || '',
+    designation: pick('designation') || '',
+    department: pick('department') || '',
+    date_of_joining: pick('date_of_joining') || '',
+    wage_type: w.wage_type || 'MONTHLY',
+    monthly_gross: Number(pick('monthly_gross')) || 0,
+    basic: Number(pick('basic')) || 0,
+    hra: Number(pick('hra')) || 0,
+    allowances: Number(pick('allowances')) || 0,
+    daily_wage: Number(pick('daily_wage')) || 0,
+    letter_date: b.letter_date || new Date().toISOString().slice(0, 10),
+  };
+  const filename = `offer_${w.id}_${Date.now()}.pdf`;
+  try {
+    await generateOfferLetter(path.join(UPLOAD_DIR, filename), terms, cfg);
+  } catch (e) {
+    console.error('Offer letter error:', e);
+    return res.status(500).json({ error: 'Could not generate offer letter' });
+  }
+  if (w.offer_letter_file) { try { fs.unlinkSync(path.join(UPLOAD_DIR, w.offer_letter_file)); } catch (_) {} }
+  db.prepare("UPDATE workers SET offer_letter_file=?, offer_letter_at=datetime('now'), offer_terms=? WHERE id=?")
+    .run(filename, JSON.stringify(terms), w.id);
+  audit(req.user.id, 'OFFER_LETTER', { id: w.id });
+  res.json({ url: '/uploads/' + filename });
+});
+
 // ---- Attendance -----------------------------------------------------------
 app.get('/api/attendance', auth, requireRole(...DRONA_HR), (req, res) => {
   const date = req.query.date || new Date().toISOString().slice(0, 10);
@@ -833,7 +1070,7 @@ app.get('/api/attendance', auth, requireRole(...DRONA_HR), (req, res) => {
       a.status, a.in_time, a.out_time, a.ot_hours, a.remarks
     FROM workers w
     LEFT JOIN attendance a ON a.worker_id = w.id AND a.work_date = ?
-    WHERE w.status = 'ACTIVE'`;
+    WHERE w.status = 'ACTIVE' AND w.onboard_status = 'APPROVED'`;
   const args = [date];
   if (dept) { sql += ' AND w.department = ?'; args.push(dept); }
   sql += ' ORDER BY w.department, w.name';
@@ -861,7 +1098,7 @@ app.post('/api/attendance', auth, requireRole('OPERATOR', 'ADMIN'), (req, res) =
 
 app.get('/api/attendance/register', auth, requireRole(...DRONA_HR), (req, res) => {
   const month = req.query.month || new Date().toISOString().slice(0, 7);
-  const workers = db.prepare("SELECT id, roll_no, name, department FROM workers WHERE status='ACTIVE' ORDER BY department, name").all();
+  const workers = db.prepare("SELECT id, roll_no, name, department FROM workers WHERE status='ACTIVE' AND onboard_status='APPROVED' ORDER BY department, name").all();
   const recs = db.prepare(`SELECT worker_id, work_date, status, ot_hours FROM attendance WHERE substr(work_date,1,7)=?`).all(month);
   const byWorker = {};
   for (const r of recs) {
@@ -931,7 +1168,7 @@ app.get('/api/leave/balances', auth, requireRole(...DRONA_HR), (req, res) => {
   const policy = getSetting('leave_policy', config.LEAVE_POLICY);
   const workers = req.query.worker_id
     ? db.prepare("SELECT id, roll_no, name, department FROM workers WHERE id = ?").all(Number(req.query.worker_id))
-    : db.prepare("SELECT id, roll_no, name, department FROM workers WHERE status='ACTIVE' ORDER BY name").all();
+    : db.prepare("SELECT id, roll_no, name, department FROM workers WHERE status='ACTIVE' AND onboard_status='APPROVED' ORDER BY name").all();
   const taken = db.prepare(`SELECT worker_id, leave_type, COALESCE(SUM(days),0) d
     FROM leave_applications WHERE status='APPROVED' AND substr(from_date,1,4)=? GROUP BY worker_id, leave_type`).all(year);
   const takenMap = {};
@@ -950,7 +1187,7 @@ app.get('/api/leave/balances', auth, requireRole(...DRONA_HR), (req, res) => {
 app.get('/api/compliance/wage-register', auth, requireRole('ADMIN', 'HQ'), (req, res) => {
   const month = req.query.month || new Date().toISOString().slice(0, 7);
   const stdDays = config.WORKING_DAYS_PER_MONTH || 26;
-  const workers = db.prepare("SELECT * FROM workers WHERE status='ACTIVE' ORDER BY department, name").all();
+  const workers = db.prepare("SELECT * FROM workers WHERE status='ACTIVE' AND onboard_status='APPROVED' ORDER BY department, name").all();
   const att = db.prepare(`SELECT worker_id, status, ot_hours FROM attendance WHERE substr(work_date,1,7)=?`).all(month);
   const byW = {};
   att.forEach(a => { const m = byW[a.worker_id] = byW[a.worker_id] || { p: 0, ot: 0 };
@@ -985,6 +1222,58 @@ app.get('/api/audit', auth, requireRole('ADMIN'), (req, res) => {
     FROM audit_log a LEFT JOIN users u ON u.id = a.user_id
     ORDER BY a.id DESC LIMIT ?`).all(limit);
   res.json({ entries: rows });
+});
+
+// ---- PDI parts master -----------------------------------------------------
+app.get('/api/pdi-parts', auth, (req, res) => {
+  const all = req.query.all === '1' && req.user.role === 'ADMIN';
+  const sql = 'SELECT id, part_no, category, description, active FROM pdi_parts'
+    + (all ? '' : ' WHERE active = 1') + ' ORDER BY category, part_no';
+  res.json({ parts: db.prepare(sql).all() });
+});
+
+app.post('/api/pdi-parts', auth, requireRole('ADMIN'), (req, res) => {
+  const b = req.body || {};
+  const part_no = String(b.part_no || '').trim().toUpperCase();
+  if (!part_no) return res.status(400).json({ error: 'Part number required' });
+  const category = ['CHASSIS', 'BUS_BODY', 'OTHER'].includes(b.category) ? b.category : 'OTHER';
+  try {
+    const info = db.prepare('INSERT INTO pdi_parts (part_no, category, description) VALUES (?,?,?)')
+      .run(part_no, category, b.description || null);
+    audit(req.user.id, 'PDI_PART_ADD', { part_no });
+    res.json({ id: info.lastInsertRowid });
+  } catch (e) {
+    if (/UNIQUE/.test(e.message)) return res.status(409).json({ error: 'Part number already exists' });
+    throw e;
+  }
+});
+
+app.post('/api/pdi-parts/:id/toggle', auth, requireRole('ADMIN'), (req, res) => {
+  const p = db.prepare('SELECT id FROM pdi_parts WHERE id=?').get(Number(req.params.id));
+  if (!p) return res.status(404).json({ error: 'Not found' });
+  db.prepare('UPDATE pdi_parts SET active = CASE active WHEN 1 THEN 0 ELSE 1 END WHERE id=?').run(p.id);
+  res.json({ ok: true });
+});
+
+// Bulk import — paste part numbers (any whitespace/comma/semicolon separated).
+// Re-importing an updated sheet adds new parts and reactivates existing ones.
+app.post('/api/pdi-parts/import', auth, requireRole('ADMIN'), (req, res) => {
+  const b = req.body || {};
+  const category = ['CHASSIS', 'BUS_BODY', 'OTHER'].includes(b.category) ? b.category : 'OTHER';
+  const tokens = [...new Set(String(b.text || '').split(/[\s,;]+/).map(s => s.trim().toUpperCase()).filter(Boolean))];
+  if (!tokens.length) return res.status(400).json({ error: 'No part numbers found' });
+  const insert = db.prepare('INSERT OR IGNORE INTO pdi_parts (part_no, category) VALUES (?,?)');
+  const reactivate = db.prepare('UPDATE pdi_parts SET active = 1, category = ? WHERE part_no = ?');
+  let added = 0, updated = 0;
+  const tx = db.transaction(() => {
+    for (const t of tokens) {
+      const info = insert.run(t, category);
+      if (info.changes) added++; else { reactivate.run(category, t); updated++; }
+    }
+  });
+  tx();
+  audit(req.user.id, 'PDI_PART_IMPORT', { category, added, updated });
+  res.json({ added, updated, total: tokens.length });
 });
 
 // ---- Static frontend ------------------------------------------------------
