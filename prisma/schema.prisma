@@ -27,7 +27,11 @@ model User {
   role         String // OPERATOR | JMC_APPROVER | HQ | ADMIN
   company      String // DRONA | JMC
   active       Boolean  @default(true)
+  email        String?
   createdAt    DateTime @default(now()) @map("created_at")
+  // Password-reset OTP (hashed, single-use, short expiry). Emailed to `email`.
+  resetOtpHash    String?   @map("reset_otp_hash")
+  resetOtpExpires DateTime? @map("reset_otp_expires")
 
   sessions Session[]
 

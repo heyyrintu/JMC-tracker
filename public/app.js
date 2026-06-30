@@ -70,6 +70,49 @@ const DISC_TYPES = {
 })();
 
 // ---- login ----------------------------------------------------------------
+// Forgot-password (emailed OTP) — two-step modal opened from the login screen.
+function forgotPasswordModal() {
+  const ov = h(`<div class="modal-backdrop"><div class="modal" style="max-width:420px">
+    <h3>Reset password</h3>
+    <div id="fpStep1">
+      <p class="muted small">Enter your username or email. If a matching account with an email exists, we'll send a 6-digit code.</p>
+      <div class="field"><label>Username or email</label><input id="fpIdent" autocomplete="username"></div>
+      <div class="btn-row" style="justify-content:flex-end"><button class="btn ghost" id="fpCancel">Cancel</button>
+        <button class="btn primary" id="fpSend">Send code</button></div>
+    </div>
+    <div id="fpStep2" style="display:none">
+      <p class="muted small">Enter the 6-digit code from your email and choose a new password.</p>
+      <div class="field"><label>Reset code</label><input id="fpOtp" inputmode="numeric" maxlength="6" autocomplete="one-time-code"></div>
+      <div class="field"><label>New password <span class="muted small">(min 5 chars)</span></label><input id="fpPw" type="password" autocomplete="new-password"></div>
+      <div class="btn-row" style="justify-content:flex-end"><button class="btn ghost" id="fpBack">Back</button>
+        <button class="btn primary" id="fpReset">Reset password</button></div>
+    </div>
+  </div></div>`);
+  document.body.appendChild(ov);
+  const close = () => ov.remove();
+  const ident = () => $('#fpIdent').value.trim();
+  ov.querySelector('#fpCancel').addEventListener('click', close);
+  ov.addEventListener('click', e => { if (e.target === ov) close(); });
+  $('#fpIdent').focus();
+  $('#fpSend').addEventListener('click', async () => {
+    if (!ident()) { toast('Enter your username or email', 'bad'); return; }
+    try {
+      const r = await api('/forgot-password', { method: 'POST', body: { ident: ident() } });
+      toast(r.message || 'If the account exists, a code was sent', 'ok');
+      $('#fpStep1').style.display = 'none'; $('#fpStep2').style.display = 'block'; $('#fpOtp').focus();
+    } catch (e) { toast(e.message, 'bad'); }
+  });
+  $('#fpBack').addEventListener('click', () => { $('#fpStep2').style.display = 'none'; $('#fpStep1').style.display = 'block'; });
+  $('#fpReset').addEventListener('click', async () => {
+    const otp = $('#fpOtp').value.trim(), password = $('#fpPw').value;
+    if (!otp || password.length < 5) { toast('Enter the code and a new password (min 5 chars)', 'bad'); return; }
+    try {
+      await api('/reset-password', { method: 'POST', body: { ident: ident(), otp, password } });
+      toast('Password reset — please sign in', 'ok'); close();
+    } catch (e) { toast(e.message, 'bad'); }
+  });
+}
+
 function renderLogin(errMsg) {
   document.body.classList.add('login-mode');
   $('#root').innerHTML = '';
@@ -81,6 +124,7 @@ function renderLogin(errMsg) {
     <div class="field"><label>Username</label><input name="username" autocomplete="username" autofocus required></div>
     <div class="field"><label>Password</label><input name="password" type="password" autocomplete="current-password" required></div>
     <button class="btn primary" style="width:100%" type="submit">Sign in</button>
+    <a id="forgotLink" style="display:block;text-align:center;margin-top:10px;color:#9fc3df;cursor:pointer;font-size:13px">Forgot password?</a>
     ${State.cfg.demo ? `<div class="demo"><b>Demo logins</b><br>
       Admin <code>admin / admin123</code><br>
       Operator <code>operator / oper123</code><br>
@@ -96,6 +140,7 @@ function renderLogin(errMsg) {
       State.user = r.user; document.body.classList.remove('login-mode'); renderApp();
     } catch (err) { renderLogin(err.message); }
   });
+  const fl = $('#forgotLink'); if (fl) fl.addEventListener('click', forgotPasswordModal);
 }
 
 // ---- shell ----------------------------------------------------------------
@@ -981,12 +1026,13 @@ ROUTES.users = async function () {
         <div class="field"><label>Password</label><input id="uPass"></div>
         <div class="field"><label>Role</label><select id="uRole">${Object.entries(State.cfg.roles).map(([k,l])=>`<option value="${k}">${esc(l)}</option>`).join('')}</select></div>
         <div class="field"><label>Company</label><select id="uCo"><option>DRONA</option><option>JMC</option></select></div>
+        <div class="field"><label>Email <span class="muted small">(for password reset)</span></label><input id="uEmail" type="email" placeholder="name@company.com"></div>
       </div><button class="btn primary" id="uAdd">Add user</button></div>
      <div id="uList"></div>`;
   $('#uAdd').addEventListener('click', async () => {
     try { await api('/users', { method:'POST', body:{ name:$('#uName').value, username:$('#uUser').value,
-      password:$('#uPass').value, role:$('#uRole').value, company:$('#uCo').value } });
-      toast('User created','ok'); $('#uName').value=$('#uUser').value=$('#uPass').value=''; load();
+      password:$('#uPass').value, role:$('#uRole').value, company:$('#uCo').value, email:$('#uEmail').value } });
+      toast('User created','ok'); $('#uName').value=$('#uUser').value=$('#uPass').value=$('#uEmail').value=''; load();
     } catch (e) { toast(e.message,'bad'); }
   });
   load();
@@ -994,11 +1040,18 @@ ROUTES.users = async function () {
     const r = await api('/users');
     const rows = r.users.map(u => `<tr><td>${esc(u.name)}</td><td>${esc(u.username)}</td>
       <td>${esc(State.cfg.roles[u.role]||u.role)}</td><td>${esc(u.company)}</td>
+      <td class="small">${u.email?esc(u.email):'<span class="muted">— none —</span>'}</td>
       <td><span class="pill ${u.active?'ok':'bad'}">${u.active?'Active':'Disabled'}</span></td>
-      <td class="right"><button class="btn ghost sm" data-pw="${u.id}">Reset PW</button>
+      <td class="right"><button class="btn ghost sm" data-em="${u.id}">Email</button>
+        <button class="btn ghost sm" data-pw="${u.id}">Reset PW</button>
         <button class="btn ghost sm" data-tg="${u.id}">${u.active?'Disable':'Enable'}</button></td></tr>`).join('');
-    $('#uList').innerHTML = `<div class="card"><table><thead><tr><th>Name</th><th>Username</th><th>Role</th><th>Company</th><th>Status</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`;
+    $('#uList').innerHTML = `<div class="card"><table><thead><tr><th>Name</th><th>Username</th><th>Role</th><th>Company</th><th>Email</th><th>Status</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`;
     $('#uList').querySelectorAll('[data-tg]').forEach(b=>b.addEventListener('click', async ()=>{ await api(`/users/${b.dataset.tg}/toggle`,{method:'POST'}); load(); }));
+    $('#uList').querySelectorAll('[data-em]').forEach(b=>b.addEventListener('click', async ()=>{
+      const em = prompt('Email for password reset (leave blank to clear):'); if(em===null) return;
+      try { await api(`/users/${b.dataset.em}/email`,{method:'POST',body:{email:em.trim()}}); toast('Email updated','ok'); load(); }
+      catch(e){ toast(e.message,'bad'); }
+    }));
     $('#uList').querySelectorAll('[data-pw]').forEach(b=>b.addEventListener('click', async ()=>{
       const p = prompt('New password (min 5 chars):'); if(!p) return;
       try { await api(`/users/${b.dataset.pw}/reset-password`,{method:'POST',body:{password:p}}); toast('Password reset','ok'); }

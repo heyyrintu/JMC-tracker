@@ -92,7 +92,7 @@ function audit(userId, action, detail) {
 function publicUser(u) {
   if (!u) return null;
   return { id: u.id, name: u.name, username: u.username, role: u.role, company: u.company,
-           roleLabel: config.ROLES[u.role] || u.role };
+           email: u.email || null, roleLabel: config.ROLES[u.role] || u.role };
 }
 async function currentUser(req) {
   const token = req.cookies.sid;
@@ -167,6 +167,60 @@ app.post('/api/login', async (req, res) => {
 app.post('/api/logout', auth, async (req, res) => {
   await db.prepare('DELETE FROM sessions WHERE token = ?').run(req.cookies.sid);
   res.clearCookie('sid');
+  res.json({ ok: true });
+});
+
+// ---- Password reset via emailed OTP ---------------------------------------
+const OTP_TTL_MIN = 10;
+// Per-IP throttle for the public reset endpoints (zero-dependency, resets on restart).
+const otpHits = new Map();
+function otpAllowed(ip) {
+  const now = Date.now(); const r = otpHits.get(ip);
+  if (!r || now - r.first > 15 * 60 * 1000) { otpHits.set(ip, { first: now, count: 1 }); return true; }
+  r.count++; return r.count <= 5;
+}
+// Look a user up by username OR email (case-insensitive email), active only.
+function findByIdent(ident) {
+  return db.prepare("SELECT * FROM users WHERE active = true AND (username = ? OR lower(email) = lower(?))").get(ident, ident);
+}
+
+// Step 1 — request a code. Always responds generically so it can't be used to
+// probe which usernames/emails exist (anti-enumeration).
+app.post('/api/forgot-password', async (req, res) => {
+  const ip = req.ip || 'unknown';
+  if (!otpAllowed(ip)) return res.status(429).json({ error: 'Too many requests — try again later' });
+  const ident = String((req.body || {}).ident || '').trim();
+  if (!ident) return res.status(400).json({ error: 'Enter your username or email' });
+  const u = await findByIdent(ident);
+  if (u && u.email && mailer.isConfigured()) {
+    const otp = String(Math.floor(100000 + Math.random() * 900000)); // 6 digits
+    await db.prepare(`UPDATE users SET reset_otp_hash=?, reset_otp_expires = now() + interval '${OTP_TTL_MIN} minutes' WHERE id=?`)
+      .run(bcrypt.hashSync(otp, 10), u.id);
+    mailer.sendMail({ to: u.email, subject: '[Drona] Your password reset code',
+      html: `<p>Hi ${u.name},</p><p>Your password reset code is <b style="font-size:22px;letter-spacing:3px">${otp}</b></p>
+        <p>It expires in ${OTP_TTL_MIN} minutes. If you didn't request this, you can ignore this email.</p>` })
+      .catch(e => console.error('OTP mail failed:', e.message));
+    audit(u.id, 'OTP_REQUEST');
+  }
+  res.json({ ok: true, message: 'If a matching account with an email exists, a reset code has been sent.' });
+});
+
+// Step 2 — verify the code and set a new password. Revokes all sessions.
+app.post('/api/reset-password', async (req, res) => {
+  const ip = req.ip || 'unknown';
+  if (!otpAllowed(ip)) return res.status(429).json({ error: 'Too many attempts — try again later' });
+  const b = req.body || {};
+  const ident = String(b.ident || '').trim(), otp = String(b.otp || '').trim(), password = b.password || '';
+  if (!ident || !otp || !password) return res.status(400).json({ error: 'All fields are required' });
+  if (password.length < 5) return res.status(400).json({ error: 'Password must be at least 5 characters' });
+  const u = await findByIdent(ident);
+  const valid = u && u.reset_otp_hash && u.reset_otp_expires
+    && new Date(u.reset_otp_expires) > new Date() && bcrypt.compareSync(otp, u.reset_otp_hash);
+  if (!valid) return res.status(400).json({ error: 'Invalid or expired code' });
+  await db.prepare('UPDATE users SET password_hash=?, reset_otp_hash=NULL, reset_otp_expires=NULL WHERE id=?')
+    .run(bcrypt.hashSync(password, 10), u.id);
+  await db.prepare('DELETE FROM sessions WHERE user_id=?').run(u.id); // sign out everywhere
+  audit(u.id, 'PASSWORD_RESET');
   res.json({ ok: true });
 });
 
@@ -665,18 +719,19 @@ app.put('/api/settings', auth, requireRole('ADMIN'), async (req, res) => {
 });
 
 app.get('/api/users', auth, requireRole('ADMIN'), async (req, res) => {
-  res.json({ users: await db.prepare('SELECT id, name, username, role, company, active FROM users ORDER BY id').all() });
+  res.json({ users: await db.prepare('SELECT id, name, username, role, company, active, email FROM users ORDER BY id').all() });
 });
 
 app.post('/api/users', auth, requireRole('ADMIN'), async (req, res) => {
-  const { name, username, password, role, company } = req.body || {};
+  const { name, username, password, role, company, email } = req.body || {};
   if (!name || !username || !password || !role || !company)
     return res.status(400).json({ error: 'All fields required' });
   if (password.length < 5) return res.status(400).json({ error: 'Password must be at least 5 characters' });
   if (!config.ROLES[role]) return res.status(400).json({ error: 'Invalid role' });
+  if (email && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return res.status(400).json({ error: 'Invalid email address' });
   try {
-    await db.prepare(`INSERT INTO users (name, username, password_hash, role, company) VALUES (?,?,?,?,?)`)
-      .run(name, username.trim(), bcrypt.hashSync(password, 10), role, company);
+    await db.prepare(`INSERT INTO users (name, username, password_hash, role, company, email) VALUES (?,?,?,?,?,?)`)
+      .run(name, username.trim(), bcrypt.hashSync(password, 10), role, company, email ? email.trim() : null);
     audit(req.user.id, 'USER_CREATE', { username });
     res.json({ ok: true });
   } catch (e) {
@@ -701,6 +756,15 @@ app.post('/api/users/:id/reset-password', auth, requireRole('ADMIN'), async (req
   const { password } = req.body || {};
   if (!password || password.length < 5) return res.status(400).json({ error: 'Password too short' });
   await db.prepare('UPDATE users SET password_hash=? WHERE id=?').run(bcrypt.hashSync(password, 10), Number(req.params.id));
+  res.json({ ok: true });
+});
+
+// Set / update a user's email (needed for OTP password reset to reach them).
+app.post('/api/users/:id/email', auth, requireRole('ADMIN'), async (req, res) => {
+  const email = String((req.body || {}).email || '').trim();
+  if (email && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return res.status(400).json({ error: 'Invalid email address' });
+  await db.prepare('UPDATE users SET email=? WHERE id=?').run(email || null, Number(req.params.id));
+  audit(req.user.id, 'USER_EMAIL_SET', { id: Number(req.params.id) });
   res.json({ ok: true });
 });
 
