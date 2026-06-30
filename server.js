@@ -1323,6 +1323,14 @@ app.get('/api/alerts/preview', auth, requireRole('ADMIN', 'HQ'), async (req, res
   res.json({ month, smtp_configured: mailer.isConfigured(), items: await alerts.evaluate(month) });
 });
 
+// Send the daily operations summary immediately (test / on-demand).
+app.post('/api/alerts/summary-now', auth, requireRole('ADMIN'), async (req, res) => {
+  if (!mailer.isConfigured()) return res.status(400).json({ error: 'SMTP is not configured (set SMTP_HOST etc. in .env)' });
+  const result = await alerts.runDailySummary(true);
+  audit(req.user.id, 'SUMMARY_SEND');
+  res.json({ ok: true, result });
+});
+
 // ---- PDF: monthly report + GST invoice (Drona internal) -------------------
 app.get('/api/reports/monthly.pdf', auth, requireRole('ADMIN', 'HQ'), async (req, res) => {
   const month = req.query.month || new Date().toISOString().slice(0, 7);

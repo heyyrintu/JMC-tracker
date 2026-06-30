@@ -89,6 +89,12 @@ module.exports = {
     pending_mp_max: 1,       // alert when pending manpower requests exceed this
     doc_expiry_days: 45,     // alert on worker documents expiring within N days
     mg_short_days_max: 1,    // alert when QC days below MG exceed this
+    // Daily operations summary email (separate from the threshold digest above).
+    // Always sends when enabled — the dashboard rolled up for the prior day +
+    // month-to-date — to its own recipient list.
+    summary_enabled: false,
+    summary_recipients: '',  // comma-separated; independent of `recipients`
+    summary_hour: 0,         // local hour to send (0 = 12 AM / midnight)
   },
 
   // ---- Offer letter (generated after HQ approval) -------------------------

@@ -943,9 +943,18 @@ ROUTES.settings = async function () {
         <div class="field"><label>Doc expiry within (days)</label><input type="number" min="1" id="alDoc" value="${(c.alerts||{}).doc_expiry_days??45}"></div>
         <div class="field"><label>MG-short days over</label><input type="number" min="0" id="alMg" value="${(c.alerts||{}).mg_short_days_max??1}"></div>
       </div>
+      <div style="border-top:1px solid var(--line);margin-top:12px;padding-top:10px">
+        <label class="inline"><input type="checkbox" id="alSumEnabled" ${(c.alerts||{}).summary_enabled?'checked':''} style="width:auto"> Daily operations summary email <span class="muted small">(yesterday + month-to-date, sent every day)</span></label>
+        <div class="grid g3" style="margin-top:8px">
+          <div class="field" style="grid-column:span 2"><label>Summary recipients <span class="muted small">(separate list)</span></label>
+            <textarea id="alSumRecip" rows="2" placeholder="ops@drona.com, owner@drona.com">${esc((c.alerts||{}).summary_recipients||'')}</textarea></div>
+          <div class="field"><label>Send at hour <span class="muted small">(0 = 12 AM)</span></label><input type="number" min="0" max="23" id="alSumHour" value="${(c.alerts||{}).summary_hour??0}"></div>
+        </div>
+      </div>
       <div class="btn-row" style="margin-top:8px">
         <button class="btn ghost sm" id="alTest">Send test email</button>
         <button class="btn ghost sm" id="alPreview">Preview alerts now</button>
+        <button class="btn ghost sm" id="alSumNow">Send summary now</button>
       </div>
       <div id="alOut" class="small" style="margin-top:8px"></div></div>
      <button class="btn primary" id="saveSet">Save settings</button>
@@ -978,6 +987,8 @@ ROUTES.settings = async function () {
         digest_hour: +$('#alHour').value||0, pnl_day_threshold: +$('#alPnlDay').value||0,
         pending_approvals_max: +$('#alPa').value||0, pending_mp_max: +$('#alPm').value||0,
         doc_expiry_days: +$('#alDoc').value||0, mg_short_days_max: +$('#alMg').value||0,
+        summary_enabled: $('#alSumEnabled').checked, summary_recipients: $('#alSumRecip').value.trim(),
+        summary_hour: +$('#alSumHour').value||0,
       },
     };
     try { const r = await api('/settings', { method:'PUT', body }); State.cfg = r.config; toast('Settings saved','ok'); ROUTES.settings(); }
@@ -992,6 +1003,10 @@ ROUTES.settings = async function () {
       $('#alOut').innerHTML = r.items.length
         ? `<b>Would alert (${r.items.length}):</b><ul style="margin:4px 0">${r.items.map(i=>`<li><span class="${i.level==='critical'?'flag':''}">${esc(i.title)}</span> — <span class="muted">${esc(i.detail||'')}</span></li>`).join('')}</ul>${r.smtp_configured?'':'<div class="flag">SMTP not configured in .env — emails are logged &amp; skipped.</div>'}`
         : '<span class="pill ok">No alerts would fire right now.</span>'; }
+    catch (e) { toast(e.message,'bad'); } });
+  const alSum = $('#alSumNow'); if (alSum) alSum.addEventListener('click', async () => {
+    try { const r = await api('/alerts/summary-now', { method:'POST', body:{} });
+      toast(r.result && r.result.skipped ? ('Skipped: '+r.result.skipped) : 'Daily summary sent','ok'); }
     catch (e) { toast(e.message,'bad'); } });
 
   // ---- PDI parts master management ----
@@ -1410,7 +1425,7 @@ ROUTES.workers = async function () {
         <input id="wq" placeholder="Search name / roll / mobile" style="max-width:240px">
         <select id="wdept" style="width:auto"><option value="">All departments</option>${DEPARTMENTS().map(d=>`<option>${esc(d)}</option>`).join('')}</select>
         <select id="wstatus" style="width:auto"><option value="ACTIVE">Active</option><option value="INACTIVE">Inactive</option><option value="">All</option></select>
-        ${canManage?`<button class="btn primary" id="wadd" style="margin-left:auto">＋ Add worker</button>`:''}
+        ${canManage?`<button class="btn primary" id="wadd" style="margin-left:auto">＋ Add Blue Collar</button>`:''}
       </div></div><div id="wlist"><div class="empty">Loading…</div></div>`;
     $('#wq').addEventListener('input', deb(loadList, 300));
     $('#wdept').addEventListener('change', loadList);
@@ -1424,7 +1439,7 @@ ROUTES.workers = async function () {
     if ($('#wdept').value) qs.set('department', $('#wdept').value);
     if ($('#wstatus').value) qs.set('status', $('#wstatus').value);
     const r = await api('/workers' + (qs.toString()?'?'+qs:''));
-    if (!r.workers.length) { $('#wlist').innerHTML = `<div class="card empty">No workers found.</div>`; return; }
+    if (!r.workers.length) { $('#wlist').innerHTML = `<div class="card empty">No Blue Collars found.</div>`; return; }
     const rows = r.workers.map(w => `<tr>
       <td>${esc(w.roll_no||'—')}</td><td>${esc(w.name)}<div class="small muted">${esc(w.father_name||'')}</div></td>
       <td>${esc(w.department||'—')}<div class="small muted">${esc(w.designation||'')}</div></td>
@@ -1440,12 +1455,12 @@ ROUTES.workers = async function () {
     const w = id ? (await api('/workers/'+id)).worker : {};
     const ro = !canManage, dis = ro ? 'disabled' : '';
     const sel = (val, opts) => opts.map(o => `<option ${o===val?'selected':''}>${esc(o)}</option>`).join('');
-    v.innerHTML = topbar(id?('Worker — '+w.name):'New Worker', id?('Roll '+(w.roll_no||'—')):'Add a manpower profile') +
+    v.innerHTML = topbar(id?('Blue Collar — '+w.name):'New Blue Collar', id?('Roll '+(w.roll_no||'—')):'Add a manpower profile') +
      `<div class="card noprint"><button class="btn ghost sm" id="wback">← Back to list</button></div>
       ${id?'<div id="wbanner"></div>':''}
       <div class="card"><div class="inline" style="gap:16px">
         <div id="wphoto" style="width:84px;height:84px;border-radius:10px;background:#eef2f7;overflow:hidden;display:flex;align-items:center;justify-content:center;color:#94a3b8;font-size:11px">${w.photo_url?`<img src="${w.photo_url}" style="width:100%;height:100%;object-fit:cover">`:'No photo'}</div>
-        <div>${id&&!ro?`<input type="file" accept="image/*" id="wphotoInput"><div class="small muted">passport-size photo</div>`:''}${!id?'<div class="small muted">Save the worker first, then add photo & documents.</div>':''}</div>
+        <div>${id&&!ro?`<input type="file" accept="image/*" id="wphotoInput"><div class="small muted">passport-size photo</div>`:''}${!id?'<div class="small muted">Save the Blue Collar first, then add photo & documents.</div>':''}</div>
       </div></div>
       <div class="card"><h3>Personal</h3><div class="grid g3">
         ${F('Employee Code','f_roll_no',w.roll_no,dis)}${F('Full name *','f_name',w.name,dis)}${F("Father's name",'f_father_name',w.father_name,dis)}
@@ -1479,7 +1494,7 @@ ROUTES.workers = async function () {
         ${!ro?`<div class="inline" style="margin-top:10px"><input id="wdocType" placeholder="Doc label (e.g. Driving licence)" style="max-width:200px"><label class="small" style="margin:0">Expiry</label><input type="date" id="wdocExpiry" style="width:auto"><button class="btn ghost sm" id="wdocAdd">＋ Add other</button></div>`:''}
         <input type="file" accept="image/*,application/pdf" id="wdocFile" style="display:none"></div>
        <div id="woffer"></div>`:''}
-      ${!ro?`<div class="btn-row" style="margin-bottom:20px"><button class="btn primary" id="wsave">${id?'Save changes':'Create worker'}</button></div>`:''}`;
+      ${!ro?`<div class="btn-row" style="margin-bottom:20px"><button class="btn primary" id="wsave">${id?'Save changes':'Create Blue Collar'}</button></div>`:''}`;
     $('#wback').addEventListener('click', showList);
     if (id) { renderDocs(w); renderBanner(w); }
     const pi = $('#wphotoInput');
@@ -1509,7 +1524,7 @@ ROUTES.workers = async function () {
       body.pf_applicable = $('#f_pf_applicable').checked; body.esi_applicable = $('#f_esi_applicable').checked;
       if (!body.name) { toast('Name is required','bad'); return; }
       try { if (id) { await api('/workers/'+id,{method:'PUT',body}); toast('Saved','ok'); }
-            else { const r=await api('/workers',{method:'POST',body}); toast('Worker created','ok'); showForm(r.id); } }
+            else { const r=await api('/workers',{method:'POST',body}); toast('Blue Collar created','ok'); showForm(r.id); } }
       catch(e){ toast(e.message,'bad'); }
     });
     const SLOTS = [['AADHAAR','Aadhaar card'],['PAN','PAN card'],['PASSBOOK','Passbook / cheque']];
@@ -1676,7 +1691,7 @@ ROUTES.attendance = async function () {
   async function loadMark() {
     const qs = new URLSearchParams(); qs.set('date', $('#aDate').value); if ($('#aDept').value) qs.set('department', $('#aDept').value);
     const r = await api('/attendance?'+qs);
-    if (!r.rows.length) { $('#attTable').innerHTML = `<div class="card empty">No active workers${$('#aDept').value?' in this department':''}.</div>`; return; }
+    if (!r.rows.length) { $('#attTable').innerHTML = `<div class="card empty">No active Blue Collars${$('#aDept').value?' in this department':''}.</div>`; return; }
     const STAT=['PRESENT','ABSENT','HALF_DAY','LEAVE','WEEKLY_OFF']; const dis=canManage?'':'disabled';
     const rows = r.rows.map(w => `<tr data-wid="${w.worker_id}">
       <td>${esc(w.roll_no||'')}</td><td>${esc(w.name)}<div class="small muted">${esc(w.department||'')}</div></td>
@@ -1685,7 +1700,7 @@ ROUTES.attendance = async function () {
       <td><input type="time" data-out value="${esc(w.out_time||'')}" ${dis} style="width:108px"></td>
       <td><input type="number" data-ot value="${w.ot_hours||''}" ${dis} style="width:64px" placeholder="0"></td>
       <td><input data-rem value="${esc(w.remarks||'')}" ${dis} placeholder="—"></td></tr>`).join('');
-    $('#attTable').innerHTML = `<div class="card"><table><thead><tr><th>Roll</th><th>Worker</th><th>Status</th><th>In</th><th>Out</th><th>OT</th><th>Remarks</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+    $('#attTable').innerHTML = `<div class="card"><table><thead><tr><th>Roll</th><th>Blue Collar</th><th>Status</th><th>In</th><th>Out</th><th>OT</th><th>Remarks</th></tr></thead><tbody>${rows}</tbody></table></div>`;
   }
   async function save() {
     const records = [...document.querySelectorAll('[data-wid]')].map(tr => ({ worker_id: tr.dataset.wid, status: tr.querySelector('[data-st]').value, in_time: tr.querySelector('[data-in]').value, out_time: tr.querySelector('[data-out]').value, ot_hours: tr.querySelector('[data-ot]').value, remarks: tr.querySelector('[data-rem]').value }));
@@ -1697,13 +1712,13 @@ ROUTES.attendance = async function () {
     $('#rMonth').addEventListener('change', loadReg); $('#rCsv').addEventListener('click', csv);
     async function loadReg() {
       R = await api('/attendance/register?month='+($('#rMonth').value||monthStr()));
-      if (!R.workers.length) { $('#regTable').innerHTML = `<div class="card empty">No active workers.</div>`; return; }
+      if (!R.workers.length) { $('#regTable').innerHTML = `<div class="card empty">No active Blue Collars.</div>`; return; }
       const dim = new Date(+R.month.slice(0,4), +R.month.slice(5,7), 0).getDate();
       const dayHdr = Array.from({length:dim},(_,i)=>`<th class="num" style="padding:4px">${i+1}</th>`).join('');
       const code={PRESENT:'P',ABSENT:'A',HALF_DAY:'H',LEAVE:'L',WEEKLY_OFF:'O'}, col={P:'#dcfce7',A:'#fee2e2',H:'#fef3c7',L:'#e0e7ff',O:'#eef2f7'};
       const body = R.workers.map(w => { const cells = Array.from({length:dim},(_,i)=>{ const dd=String(i+1).padStart(2,'0'); const d=w.days[dd]; const c=d?code[d.s]:''; return `<td class="num" style="padding:4px;background:${c?col[c]:''}">${c}</td>`; }).join('');
         return `<tr><td style="white-space:nowrap">${esc(w.name)}<div class="small muted">${esc(w.department||'')}</div></td>${cells}<td class="num"><b>${w.present_days}</b></td><td class="num">${w.absent_days}</td><td class="num">${w.ot_hours}</td></tr>`; }).join('');
-      $('#regTable').innerHTML = `<div class="card" style="overflow-x:auto"><table style="font-size:11.5px"><thead><tr><th>Worker</th>${dayHdr}<th class="num">P</th><th class="num">A</th><th class="num">OT</th></tr></thead><tbody>${body}</tbody></table>
+      $('#regTable').innerHTML = `<div class="card" style="overflow-x:auto"><table style="font-size:11.5px"><thead><tr><th>Blue Collar</th>${dayHdr}<th class="num">P</th><th class="num">A</th><th class="num">OT</th></tr></thead><tbody>${body}</tbody></table>
         <p class="small muted" style="margin-top:8px">P=Present · A=Absent · H=Half-day · L=Leave · O=Weekly off</p></div>`;
     }
     function csv() {
@@ -1743,7 +1758,7 @@ ROUTES.leave = async function () {
     const topts = State.cfg.leaveTypes.map(t => `<option>${t}</option>`).join('');
     $('#lvBody').innerHTML = (canApply?`<div class="card"><h3>Apply for leave</h3>
       <div class="grid g4">
-        <div class="field"><label>Worker</label><select id="lW">${wopts}</select></div>
+        <div class="field"><label>Blue Collar</label><select id="lW">${wopts}</select></div>
         <div class="field"><label>Type</label><select id="lT">${topts}</select></div>
         <div class="field"><label>From</label><input type="date" id="lF" value="${todayStr()}"></div>
         <div class="field"><label>To</label><input type="date" id="lTo" value="${todayStr()}"></div>
@@ -1765,7 +1780,7 @@ ROUTES.leave = async function () {
         <td>${esc(l.leave_type)}</td><td>${esc(l.from_date)} → ${esc(l.to_date)}</td><td class="num">${l.days}</td>
         <td class="small">${esc(l.reason||'')}</td><td><span class="pill ${l.status}">${l.status}</span></td>
         <td class="right">${l.status==='PENDING'&&canDecide?`<button class="btn ok sm" data-ap="${l.id}">Approve</button> <button class="btn bad sm" data-rj="${l.id}">Reject</button>`:`<span class="small muted">${esc(l.decided_by_name||'')}</span>`}</td></tr>`).join('');
-      $('#lList').innerHTML = `<div class="card"><table><thead><tr><th>Worker</th><th>Type</th><th>Period</th><th class="num">Days</th><th>Reason</th><th>Status</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`;
+      $('#lList').innerHTML = `<div class="card"><table><thead><tr><th>Blue Collar</th><th>Type</th><th>Period</th><th class="num">Days</th><th>Reason</th><th>Status</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`;
       const decide = async (id, decision) => { let remarks=''; if(decision==='REJECT') remarks=prompt('Reason (optional):')||''; try { await api(`/leave/${id}/decision`,{method:'POST',body:{decision,remarks}}); toast('Leave '+decision.toLowerCase()+'d','ok'); loadList(); refreshBadges(); } catch(e){ toast(e.message,'bad'); } };
       $('#lList').querySelectorAll('[data-ap]').forEach(b=>b.addEventListener('click',()=>decide(b.dataset.ap,'APPROVE')));
       $('#lList').querySelectorAll('[data-rj]').forEach(b=>b.addEventListener('click',()=>decide(b.dataset.rj,'REJECT')));
@@ -1776,10 +1791,10 @@ ROUTES.leave = async function () {
     $('#bYear').addEventListener('change', loadBal); loadBal();
     async function loadBal() {
       const d = await api('/leave/balances?year='+$('#bYear').value);
-      if (!d.workers.length) { $('#balTable').innerHTML = `<div class="card empty">No active workers.</div>`; return; }
+      if (!d.workers.length) { $('#balTable').innerHTML = `<div class="card empty">No active Blue Collars.</div>`; return; }
       const th = d.types.map(t => `<th class="num">${t}</th>`).join('');
       const rows = d.workers.map(w => `<tr><td>${esc(w.name)}<div class="small muted">${esc(w.department||'')}</div></td>${w.byType.map(b=>`<td class="num" title="entitlement ${b.entitlement} · taken ${b.taken}">${b.balance}<span class="small muted">/${b.entitlement}</span></td>`).join('')}</tr>`).join('');
-      $('#balTable').innerHTML = `<div class="card"><table><thead><tr><th>Worker</th>${th}</tr></thead><tbody>${rows}</tbody></table><p class="small muted" style="margin-top:8px">Each cell: remaining / entitlement. Annual policy editable in Settings.</p></div>`;
+      $('#balTable').innerHTML = `<div class="card"><table><thead><tr><th>Blue Collar</th>${th}</tr></thead><tbody>${rows}</tbody></table><p class="small muted" style="margin-top:8px">Each cell: remaining / entitlement. Annual policy editable in Settings.</p></div>`;
     }
   }
 };
@@ -1807,11 +1822,11 @@ ROUTES.compliance = async function () {
     loadW();
     async function loadW() {
       W = await api('/compliance/wage-register?month='+($('#wgMonth').value||monthStr()));
-      if (!W.rows.length) { $('#wgBody').innerHTML = `<div class="card empty">No active workers.</div>`; return; }
+      if (!W.rows.length) { $('#wgBody').innerHTML = `<div class="card empty">No active Blue Collars.</div>`; return; }
       const t = W.totals;
       const rows = W.rows.map(r => `<tr><td>${esc(r.roll_no||'')}</td><td>${esc(r.name)}<div class="small muted">${esc(r.department||'')}</div></td><td class="num">${r.present_days}</td><td class="num">${inr(r.gross)}</td><td class="num">${inr(r.ot_pay)}</td><td class="num">−${fmt(r.pf)}</td><td class="num">−${fmt(r.esi)}</td><td class="num"><b>${inr(r.net)}</b></td></tr>`).join('');
       $('#wgBody').innerHTML = `<div class="card"><div class="printonly"><h2 style="margin:0">Wage Register — ${esc(W.month)}</h2><div class="muted small">${esc(State.cfg.company.provider)} · standard ${W.std_days} days</div></div>
-        <table><thead><tr><th>Roll</th><th>Worker</th><th class="num">Present</th><th class="num">Gross</th><th class="num">OT</th><th class="num">PF</th><th class="num">ESI</th><th class="num">Net</th></tr></thead><tbody>${rows}
+        <table><thead><tr><th>Roll</th><th>Blue Collar</th><th class="num">Present</th><th class="num">Gross</th><th class="num">OT</th><th class="num">PF</th><th class="num">ESI</th><th class="num">Net</th></tr></thead><tbody>${rows}
         <tr style="font-weight:700;background:#f8fafc"><td colspan="2">TOTAL</td><td class="num">${t.present}</td><td class="num">${inr(t.gross)}</td><td class="num">${inr(t.ot)}</td><td class="num">−${fmt(t.pf)}</td><td class="num">−${fmt(t.esi)}</td><td class="num">${inr(t.net)}</td></tr>
         </tbody></table><p class="small muted" style="margin-top:8px">Computed from attendance × salary structure. PF 12% of basic; ESI 0.75% of gross (≤ ₹21,000). Costs/policy in Settings.</p></div>`;
     }
@@ -1831,7 +1846,7 @@ ROUTES.compliance = async function () {
       const d = await api('/compliance/document-expiry?days='+$('#dDays').value);
       if (!d.documents.length) { $('#dxBody').innerHTML = `<div class="card empty">No documents expiring in this window. ✓</div>`; return; }
       const rows = d.documents.map(x => `<tr><td>${esc(x.worker_name)}<div class="small muted">${esc(x.roll_no||'')} · ${esc(x.department||'')}</div></td><td>${esc(x.doc_type||'')}</td><td>${esc(x.expiry_date)}</td><td><span class="pill ${x.expired?'bad':'PENDING'}">${x.expired?'EXPIRED':'Expiring'}</span></td><td class="right"><a href="${x.url}" target="_blank" class="btn ghost sm">View</a></td></tr>`).join('');
-      $('#dxBody').innerHTML = `<div class="card"><table><thead><tr><th>Worker</th><th>Document</th><th>Expiry</th><th>Status</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`;
+      $('#dxBody').innerHTML = `<div class="card"><table><thead><tr><th>Blue Collar</th><th>Document</th><th>Expiry</th><th>Status</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`;
     }
   }
 };
