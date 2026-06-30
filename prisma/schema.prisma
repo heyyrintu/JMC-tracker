@@ -27,7 +27,11 @@ model User {
   role         String // OPERATOR | JMC_APPROVER | HQ | ADMIN
   company      String // DRONA | JMC
   active       Boolean  @default(true)
+  email        String?
   createdAt    DateTime @default(now()) @map("created_at")
+  // Password-reset OTP (hashed, single-use, short expiry). Emailed to `email`.
+  resetOtpHash    String?   @map("reset_otp_hash")
+  resetOtpExpires DateTime? @map("reset_otp_expires")
 
   sessions Session[]
 
@@ -358,4 +362,28 @@ model AuditLog {
   at     DateTime @default(now())
 
   @@map("audit_log")
+}
+
+// CAPA / 8D — corrective & preventive actions, optionally raised from a
+// discrepancy. Tracks owner, due date and a OPEN->IN_PROGRESS->DONE->VERIFIED
+// lifecycle so quality concerns close with accountability.
+model Capa {
+  id                  Int       @id @default(autoincrement())
+  discrepancyId       Int?      @map("discrepancy_id")
+  title               String
+  rootCause           String?   @map("root_cause")
+  correctiveAction    String?   @map("corrective_action")
+  preventiveAction    String?   @map("preventive_action")
+  owner               String?
+  dueDate             String?   @map("due_date") // YYYY-MM-DD
+  priority            String    @default("MEDIUM") // LOW | MEDIUM | HIGH
+  status              String    @default("OPEN") // OPEN | IN_PROGRESS | DONE | VERIFIED
+  verificationRemarks String?   @map("verification_remarks")
+  createdBy           Int?      @map("created_by")
+  closedAt            DateTime? @map("closed_at")
+  createdAt           DateTime  @default(now()) @map("created_at")
+  updatedAt           DateTime  @default(now()) @map("updated_at")
+
+  @@index([status], map: "idx_capa_status")
+  @@map("capa")
 }

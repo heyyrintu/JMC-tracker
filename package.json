@@ -6,6 +6,7 @@
   "type": "commonjs",
   "scripts": {
     "start": "node server.js",
+    "start:prod": "prisma migrate deploy && node server.js",
     "dev": "node server.js",
     "test": "node --test",
     "prisma:generate": "prisma generate",

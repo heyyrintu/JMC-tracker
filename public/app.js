@@ -29,16 +29,17 @@ function toast(msg, kind = '') {
 }
 
 const ROLE_NAV = {
-  OPERATOR:     ['dashboard','entry','workers','onboarding','attendance','leave','compliance','discrepancies','requests','reports','mis'],
-  JMC_APPROVER: ['dashboard','approvals','discrepancies','reports','mis'],
-  HQ:           ['dashboard','workers','onboarding','attendance','leave','compliance','discrepancies','requests','reports','mis','billing'],
-  ADMIN:        ['dashboard','entry','workers','onboarding','attendance','leave','compliance','approvals','discrepancies','requests','reports','mis','billing','settings','users','audit'],
+  OPERATOR:     ['dashboard','entry','workers','onboarding','attendance','leave','compliance','discrepancies','capa','requests','reports','mis'],
+  JMC_APPROVER: ['dashboard','approvals','discrepancies','capa','reports','mis'],
+  HQ:           ['dashboard','workers','onboarding','attendance','leave','compliance','discrepancies','capa','requests','reports','mis','billing'],
+  ADMIN:        ['dashboard','entry','workers','onboarding','attendance','leave','compliance','approvals','discrepancies','capa','requests','reports','mis','billing','settings','users','audit'],
 };
 const NAV_META = {
   dashboard:{ic:'▤',label:'Dashboard'}, entry:{ic:'✎',label:'Daily Entry'},
-  workers:{ic:'⚇',label:'Workers'}, onboarding:{ic:'🪪',label:'Onboarding'}, attendance:{ic:'🗓',label:'Attendance'},
+  workers:{ic:'⚇',label:'Blue Collars'}, onboarding:{ic:'🪪',label:'Onboarding'}, attendance:{ic:'🗓',label:'Attendance'},
   leave:{ic:'🏖',label:'Leave'}, compliance:{ic:'⚖',label:'Compliance'},
   approvals:{ic:'✔',label:'EOD Approvals'}, discrepancies:{ic:'⚠',label:'Discrepancies'},
+  capa:{ic:'🛠',label:'CAPA / 8D'},
   requests:{ic:'＋',label:'Manpower Requests'},
   reports:{ic:'▦',label:'Reports'}, mis:{ic:'▣',label:'MIS Dashboard'}, billing:{ic:'₹',label:'Billing'},
   settings:{ic:'⚙',label:'Settings'}, users:{ic:'◐',label:'Users'},
@@ -69,6 +70,49 @@ const DISC_TYPES = {
 })();
 
 // ---- login ----------------------------------------------------------------
+// Forgot-password (emailed OTP) — two-step modal opened from the login screen.
+function forgotPasswordModal() {
+  const ov = h(`<div class="modal-backdrop"><div class="modal" style="max-width:420px">
+    <h3>Reset password</h3>
+    <div id="fpStep1">
+      <p class="muted small">Enter your username or email. If a matching account with an email exists, we'll send a 6-digit code.</p>
+      <div class="field"><label>Username or email</label><input id="fpIdent" autocomplete="username"></div>
+      <div class="btn-row" style="justify-content:flex-end"><button class="btn ghost" id="fpCancel">Cancel</button>
+        <button class="btn primary" id="fpSend">Send code</button></div>
+    </div>
+    <div id="fpStep2" style="display:none">
+      <p class="muted small">Enter the 6-digit code from your email and choose a new password.</p>
+      <div class="field"><label>Reset code</label><input id="fpOtp" inputmode="numeric" maxlength="6" autocomplete="one-time-code"></div>
+      <div class="field"><label>New password <span class="muted small">(min 5 chars)</span></label><input id="fpPw" type="password" autocomplete="new-password"></div>
+      <div class="btn-row" style="justify-content:flex-end"><button class="btn ghost" id="fpBack">Back</button>
+        <button class="btn primary" id="fpReset">Reset password</button></div>
+    </div>
+  </div></div>`);
+  document.body.appendChild(ov);
+  const close = () => ov.remove();
+  const ident = () => $('#fpIdent').value.trim();
+  ov.querySelector('#fpCancel').addEventListener('click', close);
+  ov.addEventListener('click', e => { if (e.target === ov) close(); });
+  $('#fpIdent').focus();
+  $('#fpSend').addEventListener('click', async () => {
+    if (!ident()) { toast('Enter your username or email', 'bad'); return; }
+    try {
+      const r = await api('/forgot-password', { method: 'POST', body: { ident: ident() } });
+      toast(r.message || 'If the account exists, a code was sent', 'ok');
+      $('#fpStep1').style.display = 'none'; $('#fpStep2').style.display = 'block'; $('#fpOtp').focus();
+    } catch (e) { toast(e.message, 'bad'); }
+  });
+  $('#fpBack').addEventListener('click', () => { $('#fpStep2').style.display = 'none'; $('#fpStep1').style.display = 'block'; });
+  $('#fpReset').addEventListener('click', async () => {
+    const otp = $('#fpOtp').value.trim(), password = $('#fpPw').value;
+    if (!otp || password.length < 5) { toast('Enter the code and a new password (min 5 chars)', 'bad'); return; }
+    try {
+      await api('/reset-password', { method: 'POST', body: { ident: ident(), otp, password } });
+      toast('Password reset — please sign in', 'ok'); close();
+    } catch (e) { toast(e.message, 'bad'); }
+  });
+}
+
 function renderLogin(errMsg) {
   document.body.classList.add('login-mode');
   $('#root').innerHTML = '';
@@ -77,9 +121,10 @@ function renderLogin(errMsg) {
     <h1>JMC Operations Tracker</h1>
     <div class="sub">${esc(State.cfg.company.provider)}</div>
     ${errMsg ? `<div class="err">${esc(errMsg)}</div>` : ''}
-    <div class="field"><label>Username</label><input name="username" autocomplete="username" autofocus required></div>
+    <div class="field"><label>Username or email</label><input name="username" autocomplete="username" autofocus required></div>
     <div class="field"><label>Password</label><input name="password" type="password" autocomplete="current-password" required></div>
     <button class="btn primary" style="width:100%" type="submit">Sign in</button>
+    <a id="forgotLink" style="display:block;text-align:center;margin-top:10px;color:#9fc3df;cursor:pointer;font-size:13px">Forgot password?</a>
     ${State.cfg.demo ? `<div class="demo"><b>Demo logins</b><br>
       Admin <code>admin / admin123</code><br>
       Operator <code>operator / oper123</code><br>
@@ -95,6 +140,7 @@ function renderLogin(errMsg) {
       State.user = r.user; document.body.classList.remove('login-mode'); renderApp();
     } catch (err) { renderLogin(err.message); }
   });
+  const fl = $('#forgotLink'); if (fl) fl.addEventListener('click', forgotPasswordModal);
 }
 
 // ---- shell ----------------------------------------------------------------
@@ -138,6 +184,7 @@ async function refreshBadges() {
     if (['HQ','ADMIN'].includes(State.user.role)) set('requests', s.pending_mp_requests);
     if (['HQ','ADMIN'].includes(State.user.role)) set('onboarding', s.pending_onboarding);
     set('discrepancies', s.open_discrepancies);
+    set('capa', s.overdue_capa);
     if (['HQ','ADMIN'].includes(State.user.role)) set('leave', s.pending_leaves);
     set('compliance', s.expiring_docs);
   } catch (_) {}
@@ -778,6 +825,80 @@ ROUTES.reports = async function () {
 // ===========================================================================
 // SETTINGS (Admin)
 // ===========================================================================
+// ===========================================================================
+// CAPA / 8D  (corrective & preventive actions)
+// ===========================================================================
+const CAPA_STATUS = ['OPEN','IN_PROGRESS','DONE','VERIFIED'];
+function capaModal(prefill = {}, onSaved) {
+  const isEdit = !!prefill.id;
+  const prioOpt = (v)=>['LOW','MEDIUM','HIGH'].map(s=>`<option ${s===(v||'MEDIUM')?'selected':''}>${s}</option>`).join('');
+  const statusOpt = (v)=>CAPA_STATUS.map(s=>`<option ${s===(v||'OPEN')?'selected':''}>${s}</option>`).join('');
+  const canVerify = ['HQ','ADMIN'].includes(State.user.role);
+  const ov = h(`<div class="modal-backdrop"><div class="modal" style="max-width:560px">
+    <h3>${isEdit?'Edit CAPA / 8D':'New CAPA / 8D'}</h3>
+    <div class="field"><label>Title</label><input id="cpTitle" value="${esc(prefill.title||'')}"></div>
+    <div class="grid g2">
+      <div class="field"><label>Owner</label><input id="cpOwner" value="${esc(prefill.owner||'')}"></div>
+      <div class="field"><label>Due date</label><input type="date" id="cpDue" value="${esc(prefill.due_date||'')}"></div>
+      <div class="field"><label>Priority</label><select id="cpPrio">${prioOpt(prefill.priority)}</select></div>
+      ${isEdit?`<div class="field"><label>Status</label><select id="cpStatus">${statusOpt(prefill.status)}</select></div>`:''}
+    </div>
+    <div class="field"><label>Root cause</label><textarea id="cpRoot" rows="2">${esc(prefill.root_cause||'')}</textarea></div>
+    <div class="field"><label>Corrective action</label><textarea id="cpCorr" rows="2">${esc(prefill.corrective_action||'')}</textarea></div>
+    <div class="field"><label>Preventive action</label><textarea id="cpPrev" rows="2">${esc(prefill.preventive_action||'')}</textarea></div>
+    ${isEdit?`<div class="field"><label>Verification remarks ${canVerify?'':'<span class="muted small">(only HQ/Admin can set VERIFIED)</span>'}</label><input id="cpVer" value="${esc(prefill.verification_remarks||'')}"></div>`:''}
+    <div class="btn-row" style="justify-content:flex-end"><button class="btn ghost" id="cpCancel">Cancel</button>
+      <button class="btn primary" id="cpSave">${isEdit?'Save':'Create CAPA'}</button></div>
+  </div></div>`);
+  document.body.appendChild(ov);
+  const close=()=>ov.remove();
+  ov.querySelector('#cpCancel').addEventListener('click', close);
+  ov.addEventListener('click', e=>{ if(e.target===ov) close(); });
+  ov.querySelector('#cpTitle').focus();
+  ov.querySelector('#cpSave').addEventListener('click', async () => {
+    const body = { title:$('#cpTitle').value, owner:$('#cpOwner').value, due_date:$('#cpDue').value,
+      priority:$('#cpPrio').value, root_cause:$('#cpRoot').value, corrective_action:$('#cpCorr').value,
+      preventive_action:$('#cpPrev').value };
+    if (!body.title.trim()) { toast('Title is required','bad'); return; }
+    if (isEdit) { body.status=$('#cpStatus').value; const ver=$('#cpVer'); if(ver) body.verification_remarks=ver.value; }
+    if (!isEdit && prefill.discrepancy_id) body.discrepancy_id = prefill.discrepancy_id;
+    try { await api(isEdit?('/capa/'+prefill.id):'/capa', { method:isEdit?'PUT':'POST', body });
+      toast(isEdit?'CAPA updated':'CAPA created','ok'); close(); if(onSaved) onSaved(); refreshBadges(); }
+    catch (e) { toast(e.message,'bad'); }
+  });
+}
+
+ROUTES.capa = async function () {
+  const v = $('#view');
+  const canCreate = ['OPERATOR','JMC_APPROVER','HQ','ADMIN'].includes(State.user.role);
+  v.innerHTML = topbar('CAPA / 8D', 'Corrective & preventive actions — close quality concerns with accountability.') +
+    `<div class="card"><div class="btn-row">
+       <label class="small" style="margin:0">Status</label>
+       <select id="cFilter" style="width:auto"><option value="">All</option>${CAPA_STATUS.map(s=>`<option value="${s}">${s.replace('_',' ')}</option>`).join('')}</select>
+       ${canCreate?`<button class="btn primary sm" id="cNew" style="margin-left:auto">＋ New CAPA</button>`:''}
+     </div></div><div id="cList"><div class="empty">Loading…</div></div>`;
+  const cNew = $('#cNew'); if (cNew) cNew.addEventListener('click', ()=>capaModal({}, load));
+  $('#cFilter').addEventListener('change', load);
+  load();
+
+  async function load() {
+    const st = $('#cFilter').value;
+    const r = await api('/capa' + (st?'?status='+st:''));
+    if (!r.capa.length) { $('#cList').innerHTML = `<div class="card empty">No CAPAs yet.</div>`; return; }
+    const stPill = s => `<span class="pill ${s==='VERIFIED'?'ok':s==='OPEN'?'bad':''}" ${s==='IN_PROGRESS'?'style="background:#dbeafe;color:#1e40af"':s==='DONE'?'style="background:#dcfce7;color:#166534"':''}>${esc(s.replace('_',' '))}</span>`;
+    const rows = r.capa.map(c => `<tr${c.overdue?' style="background:#fff1f2"':''}>
+      <td><b>${esc(c.title)}</b>${c.disc_type?`<br><span class="tag">from ${esc(c.disc_type)}${c.disc_part_no?(' '+esc(c.disc_part_no)):''}</span>`:''}</td>
+      <td>${esc(c.owner||'—')}</td>
+      <td class="small ${c.overdue?'flag':''}">${esc(c.due_date||'—')}${c.overdue?' ⚠':''}</td>
+      <td><span class="pill ${c.priority==='HIGH'?'bad':c.priority==='LOW'?'ok':''}" ${c.priority==='MEDIUM'?'style="background:#fef3c7;color:#92400e"':''}>${esc(c.priority)}</span></td>
+      <td>${stPill(c.status)}</td>
+      <td class="right"><button class="btn ghost sm" data-edit="${c.id}">Open</button></td></tr>`).join('');
+    $('#cList').innerHTML = `<div class="card"><table><thead><tr><th>Title</th><th>Owner</th><th>Due</th><th>Priority</th><th>Status</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`;
+    $('#cList').querySelectorAll('[data-edit]').forEach(b=>b.addEventListener('click', ()=>{
+      const c = r.capa.find(x=>String(x.id)===b.dataset.edit); if(c) capaModal(c, load); }));
+  }
+};
+
 ROUTES.settings = async function () {
   const v = $('#view'); const c = State.cfg;
   v.innerHTML = topbar('Settings', 'Rates, MG and approved manpower baseline.') +
@@ -810,6 +931,32 @@ ROUTES.settings = async function () {
       </div>
       <div class="field"><label>Invoice notes</label><input id="invNotes" value="${esc((c.invoice||{}).notes||'')}"></div>
       <label class="inline"><input type="checkbox" id="mgBill" ${c.mgBilling?'checked':''} style="width:auto"> Bill QC at the guaranteed minimum (MG floor per day)</label></div>
+     <div class="card"><h3>Email Alerts <span class="muted small">(SMTP via .env · recipients below)</span></h3>
+      <label class="inline"><input type="checkbox" id="alEnabled" ${(c.alerts||{}).enabled?'checked':''} style="width:auto"> Enable email alerts (nightly digest + real-time)</label>
+      <div class="field" style="margin-top:8px"><label>Recipients <span class="muted small">(comma-separated emails)</span></label>
+        <textarea id="alRecip" rows="2" placeholder="ops@drona.com, hq@drona.com">${esc((c.alerts||{}).recipients||'')}</textarea></div>
+      <div class="grid g3">
+        <div class="field"><label>Digest hour (0–23)</label><input type="number" min="0" max="23" id="alHour" value="${(c.alerts||{}).digest_hour??2}"></div>
+        <div class="field"><label>Flag P&L negative after day</label><input type="number" min="1" max="28" id="alPnlDay" value="${(c.alerts||{}).pnl_day_threshold??20}"></div>
+        <div class="field"><label>Pending approvals over</label><input type="number" min="0" id="alPa" value="${(c.alerts||{}).pending_approvals_max??3}"></div>
+        <div class="field"><label>Pending MP requests over</label><input type="number" min="0" id="alPm" value="${(c.alerts||{}).pending_mp_max??1}"></div>
+        <div class="field"><label>Doc expiry within (days)</label><input type="number" min="1" id="alDoc" value="${(c.alerts||{}).doc_expiry_days??45}"></div>
+        <div class="field"><label>MG-short days over</label><input type="number" min="0" id="alMg" value="${(c.alerts||{}).mg_short_days_max??1}"></div>
+      </div>
+      <div style="border-top:1px solid var(--line);margin-top:12px;padding-top:10px">
+        <label class="inline"><input type="checkbox" id="alSumEnabled" ${(c.alerts||{}).summary_enabled?'checked':''} style="width:auto"> Daily operations summary email <span class="muted small">(yesterday + month-to-date, sent every day)</span></label>
+        <div class="grid g3" style="margin-top:8px">
+          <div class="field" style="grid-column:span 2"><label>Summary recipients <span class="muted small">(separate list)</span></label>
+            <textarea id="alSumRecip" rows="2" placeholder="ops@drona.com, owner@drona.com">${esc((c.alerts||{}).summary_recipients||'')}</textarea></div>
+          <div class="field"><label>Send at hour <span class="muted small">(0 = 12 AM)</span></label><input type="number" min="0" max="23" id="alSumHour" value="${(c.alerts||{}).summary_hour??0}"></div>
+        </div>
+      </div>
+      <div class="btn-row" style="margin-top:8px">
+        <button class="btn ghost sm" id="alTest">Send test email</button>
+        <button class="btn ghost sm" id="alPreview">Preview alerts now</button>
+        <button class="btn ghost sm" id="alSumNow">Send summary now</button>
+      </div>
+      <div id="alOut" class="small" style="margin-top:8px"></div></div>
      <button class="btn primary" id="saveSet">Save settings</button>
      <div class="card" style="margin-top:16px"><h3>PDI Parts Master <span class="muted small">(part numbers suggested on QC inspection lines)</span></h3>
        <div id="pdiSummary" class="muted small">Loading…</div>
@@ -835,10 +982,32 @@ ROUTES.settings = async function () {
       costs: { manpower_monthly:+$('#costMp').value||0, overhead_monthly:+$('#costOh').value||0, transport_monthly:+$('#costTr').value||0 },
       invoice: { gst_pct:+$('#invGst').value||0, gstin:$('#invGstin').value, bill_to:$('#invBillTo').value, notes:$('#invNotes').value },
       mgBilling: $('#mgBill').checked,
+      alerts: {
+        enabled: $('#alEnabled').checked, recipients: $('#alRecip').value.trim(),
+        digest_hour: +$('#alHour').value||0, pnl_day_threshold: +$('#alPnlDay').value||0,
+        pending_approvals_max: +$('#alPa').value||0, pending_mp_max: +$('#alPm').value||0,
+        doc_expiry_days: +$('#alDoc').value||0, mg_short_days_max: +$('#alMg').value||0,
+        summary_enabled: $('#alSumEnabled').checked, summary_recipients: $('#alSumRecip').value.trim(),
+        summary_hour: +$('#alSumHour').value||0,
+      },
     };
     try { const r = await api('/settings', { method:'PUT', body }); State.cfg = r.config; toast('Settings saved','ok'); ROUTES.settings(); }
     catch (e) { toast(e.message,'bad'); }
   });
+  const alTest = $('#alTest'); if (alTest) alTest.addEventListener('click', async () => {
+    try { const r = await api('/alerts/test', { method:'POST', body:{} });
+      toast(r.result && r.result.skipped ? ('Skipped: '+r.result.skipped) : 'Test email sent','ok'); }
+    catch (e) { toast(e.message,'bad'); } });
+  const alPrev = $('#alPreview'); if (alPrev) alPrev.addEventListener('click', async () => {
+    try { const r = await api('/alerts/preview');
+      $('#alOut').innerHTML = r.items.length
+        ? `<b>Would alert (${r.items.length}):</b><ul style="margin:4px 0">${r.items.map(i=>`<li><span class="${i.level==='critical'?'flag':''}">${esc(i.title)}</span> — <span class="muted">${esc(i.detail||'')}</span></li>`).join('')}</ul>${r.smtp_configured?'':'<div class="flag">SMTP not configured in .env — emails are logged &amp; skipped.</div>'}`
+        : '<span class="pill ok">No alerts would fire right now.</span>'; }
+    catch (e) { toast(e.message,'bad'); } });
+  const alSum = $('#alSumNow'); if (alSum) alSum.addEventListener('click', async () => {
+    try { const r = await api('/alerts/summary-now', { method:'POST', body:{} });
+      toast(r.result && r.result.skipped ? ('Skipped: '+r.result.skipped) : 'Daily summary sent','ok'); }
+    catch (e) { toast(e.message,'bad'); } });
 
   // ---- PDI parts master management ----
   async function loadPdi() {
@@ -872,12 +1041,13 @@ ROUTES.users = async function () {
         <div class="field"><label>Password</label><input id="uPass"></div>
         <div class="field"><label>Role</label><select id="uRole">${Object.entries(State.cfg.roles).map(([k,l])=>`<option value="${k}">${esc(l)}</option>`).join('')}</select></div>
         <div class="field"><label>Company</label><select id="uCo"><option>DRONA</option><option>JMC</option></select></div>
+        <div class="field"><label>Email <span class="muted small">(for password reset)</span></label><input id="uEmail" type="email" placeholder="name@company.com"></div>
       </div><button class="btn primary" id="uAdd">Add user</button></div>
      <div id="uList"></div>`;
   $('#uAdd').addEventListener('click', async () => {
     try { await api('/users', { method:'POST', body:{ name:$('#uName').value, username:$('#uUser').value,
-      password:$('#uPass').value, role:$('#uRole').value, company:$('#uCo').value } });
-      toast('User created','ok'); $('#uName').value=$('#uUser').value=$('#uPass').value=''; load();
+      password:$('#uPass').value, role:$('#uRole').value, company:$('#uCo').value, email:$('#uEmail').value } });
+      toast('User created','ok'); $('#uName').value=$('#uUser').value=$('#uPass').value=$('#uEmail').value=''; load();
     } catch (e) { toast(e.message,'bad'); }
   });
   load();
@@ -885,11 +1055,18 @@ ROUTES.users = async function () {
     const r = await api('/users');
     const rows = r.users.map(u => `<tr><td>${esc(u.name)}</td><td>${esc(u.username)}</td>
       <td>${esc(State.cfg.roles[u.role]||u.role)}</td><td>${esc(u.company)}</td>
+      <td class="small">${u.email?esc(u.email):'<span class="muted">— none —</span>'}</td>
       <td><span class="pill ${u.active?'ok':'bad'}">${u.active?'Active':'Disabled'}</span></td>
-      <td class="right"><button class="btn ghost sm" data-pw="${u.id}">Reset PW</button>
+      <td class="right"><button class="btn ghost sm" data-em="${u.id}">Email</button>
+        <button class="btn ghost sm" data-pw="${u.id}">Reset PW</button>
         <button class="btn ghost sm" data-tg="${u.id}">${u.active?'Disable':'Enable'}</button></td></tr>`).join('');
-    $('#uList').innerHTML = `<div class="card"><table><thead><tr><th>Name</th><th>Username</th><th>Role</th><th>Company</th><th>Status</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`;
+    $('#uList').innerHTML = `<div class="card"><table><thead><tr><th>Name</th><th>Username</th><th>Role</th><th>Company</th><th>Email</th><th>Status</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`;
     $('#uList').querySelectorAll('[data-tg]').forEach(b=>b.addEventListener('click', async ()=>{ await api(`/users/${b.dataset.tg}/toggle`,{method:'POST'}); load(); }));
+    $('#uList').querySelectorAll('[data-em]').forEach(b=>b.addEventListener('click', async ()=>{
+      const em = prompt('Email for password reset (leave blank to clear):'); if(em===null) return;
+      try { await api(`/users/${b.dataset.em}/email`,{method:'POST',body:{email:em.trim()}}); toast('Email updated','ok'); load(); }
+      catch(e){ toast(e.message,'bad'); }
+    }));
     $('#uList').querySelectorAll('[data-pw]').forEach(b=>b.addEventListener('click', async ()=>{
       const p = prompt('New password (min 5 chars):'); if(!p) return;
       try { await api(`/users/${b.dataset.pw}/reset-password`,{method:'POST',body:{password:p}}); toast('Password reset','ok'); }
@@ -992,12 +1169,15 @@ ROUTES.discrepancies = async function () {
         <td>${sevPill(d.severity)}</td>
         <td><span class="pill ${d.status==='OPEN'?'bad':'ok'}">${d.status}</span></td>
         <td class="small muted">${esc(d.raised_by_name||'')} <span class="tag">${esc(d.raised_company||'')}</span></td>
-        <td class="right">${d.status==='OPEN'&&canResolve
-          ? `<button class="btn ok sm" data-res="${d.id}">Resolve</button>`
-          : (d.resolution?`<span class="small muted" title="${esc(d.resolution)}">✓ ${esc(d.resolved_by_name||'')}</span>`:'')}</td></tr>`;
+        <td class="right"><button class="btn ghost sm" data-capa="${d.id}" data-ctype="${esc(d.type)}" data-cpart="${esc(d.part_no||'')}" title="Raise a CAPA / 8D from this concern">＋ CAPA</button>
+          ${d.status==='OPEN'&&canResolve
+          ? ` <button class="btn ok sm" data-res="${d.id}">Resolve</button>`
+          : (d.resolution?` <span class="small muted" title="${esc(d.resolution)}">✓ ${esc(d.resolved_by_name||'')}</span>`:'')}</td></tr>`;
     }).join('');
     $('#dList').innerHTML = `<div class="card"><table><thead><tr><th>Date</th><th>Type</th><th>Part</th>
       <th>Detail</th><th>Severity</th><th>Status</th><th>Raised by</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`;
+    $('#dList').querySelectorAll('[data-capa]').forEach(b=>b.addEventListener('click',()=>capaModal({ discrepancy_id:b.dataset.capa,
+      title:`${DISC_TYPES[b.dataset.ctype]||b.dataset.ctype}${b.dataset.cpart?(' — '+b.dataset.cpart):''}` }, load)));
     $('#dList').querySelectorAll('[data-res]').forEach(b=>b.addEventListener('click', async ()=>{
       const resolution = prompt('Resolution / closing note:') ; if (resolution===null) return;
       try { await api(`/discrepancies/${b.dataset.res}/resolve`,{method:'POST',body:{resolution}});
@@ -1162,10 +1342,14 @@ ROUTES.billing = async function () {
   v.innerHTML = topbar('Billing & Invoice', 'Revenue, P&L and the monthly JMC invoice (Drona internal).') +
     `<div class="card noprint"><div class="btn-row">
        <label class="small" style="margin:0">Month</label><input type="month" id="bMonth" value="${monthStr()}" style="width:auto">
-       <button class="btn ghost" id="bPrint">🖨 Print invoice / PDF</button></div></div>
+       <button class="btn ghost" id="bReport">▦ Monthly report (PDF)</button>
+       <button class="btn ghost" id="bInvoice">₹ GST invoice (PDF)</button>
+       <button class="btn ghost" id="bPrint">🖨 Print</button></div></div>
      <div id="bBody"><div class="empty">Loading…</div></div>`;
   $('#bMonth').addEventListener('change', load);
   $('#bPrint').addEventListener('click', () => window.print());
+  $('#bReport').addEventListener('click', () => window.open('/api/reports/monthly.pdf?month=' + ($('#bMonth').value || monthStr()), '_blank'));
+  $('#bInvoice').addEventListener('click', () => window.open('/api/invoice.pdf?month=' + ($('#bMonth').value || monthStr()), '_blank'));
   load();
 
   async function load() {
@@ -1236,12 +1420,12 @@ ROUTES.workers = async function () {
   if (deep) showForm(deep); else showList();
 
   async function showList() {
-    v.innerHTML = topbar('Workers — HR Master', 'Manpower profiles, salary structure and documents.') +
+    v.innerHTML = topbar('Blue Collars — HR Master', 'Manpower profiles, salary structure and documents.') +
       `<div class="card"><div class="btn-row">
         <input id="wq" placeholder="Search name / roll / mobile" style="max-width:240px">
         <select id="wdept" style="width:auto"><option value="">All departments</option>${DEPARTMENTS().map(d=>`<option>${esc(d)}</option>`).join('')}</select>
         <select id="wstatus" style="width:auto"><option value="ACTIVE">Active</option><option value="INACTIVE">Inactive</option><option value="">All</option></select>
-        ${canManage?`<button class="btn primary" id="wadd" style="margin-left:auto">＋ Add worker</button>`:''}
+        ${canManage?`<button class="btn primary" id="wadd" style="margin-left:auto">＋ Add Blue Collar</button>`:''}
       </div></div><div id="wlist"><div class="empty">Loading…</div></div>`;
     $('#wq').addEventListener('input', deb(loadList, 300));
     $('#wdept').addEventListener('change', loadList);
@@ -1255,7 +1439,7 @@ ROUTES.workers = async function () {
     if ($('#wdept').value) qs.set('department', $('#wdept').value);
     if ($('#wstatus').value) qs.set('status', $('#wstatus').value);
     const r = await api('/workers' + (qs.toString()?'?'+qs:''));
-    if (!r.workers.length) { $('#wlist').innerHTML = `<div class="card empty">No workers found.</div>`; return; }
+    if (!r.workers.length) { $('#wlist').innerHTML = `<div class="card empty">No Blue Collars found.</div>`; return; }
     const rows = r.workers.map(w => `<tr>
       <td>${esc(w.roll_no||'—')}</td><td>${esc(w.name)}<div class="small muted">${esc(w.father_name||'')}</div></td>
       <td>${esc(w.department||'—')}<div class="small muted">${esc(w.designation||'')}</div></td>
@@ -1271,15 +1455,15 @@ ROUTES.workers = async function () {
     const w = id ? (await api('/workers/'+id)).worker : {};
     const ro = !canManage, dis = ro ? 'disabled' : '';
     const sel = (val, opts) => opts.map(o => `<option ${o===val?'selected':''}>${esc(o)}</option>`).join('');
-    v.innerHTML = topbar(id?('Worker — '+w.name):'New Worker', id?('Roll '+(w.roll_no||'—')):'Add a manpower profile') +
+    v.innerHTML = topbar(id?('Blue Collar — '+w.name):'New Blue Collar', id?('Roll '+(w.roll_no||'—')):'Add a manpower profile') +
      `<div class="card noprint"><button class="btn ghost sm" id="wback">← Back to list</button></div>
       ${id?'<div id="wbanner"></div>':''}
       <div class="card"><div class="inline" style="gap:16px">
         <div id="wphoto" style="width:84px;height:84px;border-radius:10px;background:#eef2f7;overflow:hidden;display:flex;align-items:center;justify-content:center;color:#94a3b8;font-size:11px">${w.photo_url?`<img src="${w.photo_url}" style="width:100%;height:100%;object-fit:cover">`:'No photo'}</div>
-        <div>${id&&!ro?`<input type="file" accept="image/*" id="wphotoInput"><div class="small muted">passport-size photo</div>`:''}${!id?'<div class="small muted">Save the worker first, then add photo & documents.</div>':''}</div>
+        <div>${id&&!ro?`<input type="file" accept="image/*" id="wphotoInput"><div class="small muted">passport-size photo</div>`:''}${!id?'<div class="small muted">Save the Blue Collar first, then add photo & documents.</div>':''}</div>
       </div></div>
       <div class="card"><h3>Personal</h3><div class="grid g3">
-        ${F('Roll No (SL)','f_roll_no',w.roll_no,dis)}${F('Full name *','f_name',w.name,dis)}${F("Father's name",'f_father_name',w.father_name,dis)}
+        ${F('Employee Code','f_roll_no',w.roll_no,dis)}${F('Full name *','f_name',w.name,dis)}${F("Father's name",'f_father_name',w.father_name,dis)}
         ${S('Gender','f_gender',['','Male','Female','Other'],w.gender,dis)}${F('Date of birth','f_dob',w.dob,dis,'date')}${F('Blood group','f_blood_group',w.blood_group,dis)}
         ${F('Mobile','f_mobile',w.mobile,dis)}${F('Aadhaar','f_aadhaar',w.aadhaar,dis)}${F('PAN','f_pan',w.pan,dis)}
       </div><div class="field"><label>Address</label><input id="f_address" value="${esc(w.address||'')}" ${dis}></div></div>
@@ -1310,7 +1494,7 @@ ROUTES.workers = async function () {
         ${!ro?`<div class="inline" style="margin-top:10px"><input id="wdocType" placeholder="Doc label (e.g. Driving licence)" style="max-width:200px"><label class="small" style="margin:0">Expiry</label><input type="date" id="wdocExpiry" style="width:auto"><button class="btn ghost sm" id="wdocAdd">＋ Add other</button></div>`:''}
         <input type="file" accept="image/*,application/pdf" id="wdocFile" style="display:none"></div>
        <div id="woffer"></div>`:''}
-      ${!ro?`<div class="btn-row" style="margin-bottom:20px"><button class="btn primary" id="wsave">${id?'Save changes':'Create worker'}</button></div>`:''}`;
+      ${!ro?`<div class="btn-row" style="margin-bottom:20px"><button class="btn primary" id="wsave">${id?'Save changes':'Create Blue Collar'}</button></div>`:''}`;
     $('#wback').addEventListener('click', showList);
     if (id) { renderDocs(w); renderBanner(w); }
     const pi = $('#wphotoInput');
@@ -1340,7 +1524,7 @@ ROUTES.workers = async function () {
       body.pf_applicable = $('#f_pf_applicable').checked; body.esi_applicable = $('#f_esi_applicable').checked;
       if (!body.name) { toast('Name is required','bad'); return; }
       try { if (id) { await api('/workers/'+id,{method:'PUT',body}); toast('Saved','ok'); }
-            else { const r=await api('/workers',{method:'POST',body}); toast('Worker created','ok'); showForm(r.id); } }
+            else { const r=await api('/workers',{method:'POST',body}); toast('Blue Collar created','ok'); showForm(r.id); } }
       catch(e){ toast(e.message,'bad'); }
     });
     const SLOTS = [['AADHAAR','Aadhaar card'],['PAN','PAN card'],['PASSBOOK','Passbook / cheque']];
@@ -1507,7 +1691,7 @@ ROUTES.attendance = async function () {
   async function loadMark() {
     const qs = new URLSearchParams(); qs.set('date', $('#aDate').value); if ($('#aDept').value) qs.set('department', $('#aDept').value);
     const r = await api('/attendance?'+qs);
-    if (!r.rows.length) { $('#attTable').innerHTML = `<div class="card empty">No active workers${$('#aDept').value?' in this department':''}.</div>`; return; }
+    if (!r.rows.length) { $('#attTable').innerHTML = `<div class="card empty">No active Blue Collars${$('#aDept').value?' in this department':''}.</div>`; return; }
     const STAT=['PRESENT','ABSENT','HALF_DAY','LEAVE','WEEKLY_OFF']; const dis=canManage?'':'disabled';
     const rows = r.rows.map(w => `<tr data-wid="${w.worker_id}">
       <td>${esc(w.roll_no||'')}</td><td>${esc(w.name)}<div class="small muted">${esc(w.department||'')}</div></td>
@@ -1516,7 +1700,7 @@ ROUTES.attendance = async function () {
       <td><input type="time" data-out value="${esc(w.out_time||'')}" ${dis} style="width:108px"></td>
       <td><input type="number" data-ot value="${w.ot_hours||''}" ${dis} style="width:64px" placeholder="0"></td>
       <td><input data-rem value="${esc(w.remarks||'')}" ${dis} placeholder="—"></td></tr>`).join('');
-    $('#attTable').innerHTML = `<div class="card"><table><thead><tr><th>Roll</th><th>Worker</th><th>Status</th><th>In</th><th>Out</th><th>OT</th><th>Remarks</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+    $('#attTable').innerHTML = `<div class="card"><table><thead><tr><th>Roll</th><th>Blue Collar</th><th>Status</th><th>In</th><th>Out</th><th>OT</th><th>Remarks</th></tr></thead><tbody>${rows}</tbody></table></div>`;
   }
   async function save() {
     const records = [...document.querySelectorAll('[data-wid]')].map(tr => ({ worker_id: tr.dataset.wid, status: tr.querySelector('[data-st]').value, in_time: tr.querySelector('[data-in]').value, out_time: tr.querySelector('[data-out]').value, ot_hours: tr.querySelector('[data-ot]').value, remarks: tr.querySelector('[data-rem]').value }));
@@ -1528,13 +1712,13 @@ ROUTES.attendance = async function () {
     $('#rMonth').addEventListener('change', loadReg); $('#rCsv').addEventListener('click', csv);
     async function loadReg() {
       R = await api('/attendance/register?month='+($('#rMonth').value||monthStr()));
-      if (!R.workers.length) { $('#regTable').innerHTML = `<div class="card empty">No active workers.</div>`; return; }
+      if (!R.workers.length) { $('#regTable').innerHTML = `<div class="card empty">No active Blue Collars.</div>`; return; }
       const dim = new Date(+R.month.slice(0,4), +R.month.slice(5,7), 0).getDate();
       const dayHdr = Array.from({length:dim},(_,i)=>`<th class="num" style="padding:4px">${i+1}</th>`).join('');
       const code={PRESENT:'P',ABSENT:'A',HALF_DAY:'H',LEAVE:'L',WEEKLY_OFF:'O'}, col={P:'#dcfce7',A:'#fee2e2',H:'#fef3c7',L:'#e0e7ff',O:'#eef2f7'};
       const body = R.workers.map(w => { const cells = Array.from({length:dim},(_,i)=>{ const dd=String(i+1).padStart(2,'0'); const d=w.days[dd]; const c=d?code[d.s]:''; return `<td class="num" style="padding:4px;background:${c?col[c]:''}">${c}</td>`; }).join('');
         return `<tr><td style="white-space:nowrap">${esc(w.name)}<div class="small muted">${esc(w.department||'')}</div></td>${cells}<td class="num"><b>${w.present_days}</b></td><td class="num">${w.absent_days}</td><td class="num">${w.ot_hours}</td></tr>`; }).join('');
-      $('#regTable').innerHTML = `<div class="card" style="overflow-x:auto"><table style="font-size:11.5px"><thead><tr><th>Worker</th>${dayHdr}<th class="num">P</th><th class="num">A</th><th class="num">OT</th></tr></thead><tbody>${body}</tbody></table>
+      $('#regTable').innerHTML = `<div class="card" style="overflow-x:auto"><table style="font-size:11.5px"><thead><tr><th>Blue Collar</th>${dayHdr}<th class="num">P</th><th class="num">A</th><th class="num">OT</th></tr></thead><tbody>${body}</tbody></table>
         <p class="small muted" style="margin-top:8px">P=Present · A=Absent · H=Half-day · L=Leave · O=Weekly off</p></div>`;
     }
     function csv() {
@@ -1574,7 +1758,7 @@ ROUTES.leave = async function () {
     const topts = State.cfg.leaveTypes.map(t => `<option>${t}</option>`).join('');
     $('#lvBody').innerHTML = (canApply?`<div class="card"><h3>Apply for leave</h3>
       <div class="grid g4">
-        <div class="field"><label>Worker</label><select id="lW">${wopts}</select></div>
+        <div class="field"><label>Blue Collar</label><select id="lW">${wopts}</select></div>
         <div class="field"><label>Type</label><select id="lT">${topts}</select></div>
         <div class="field"><label>From</label><input type="date" id="lF" value="${todayStr()}"></div>
         <div class="field"><label>To</label><input type="date" id="lTo" value="${todayStr()}"></div>
@@ -1596,7 +1780,7 @@ ROUTES.leave = async function () {
         <td>${esc(l.leave_type)}</td><td>${esc(l.from_date)} → ${esc(l.to_date)}</td><td class="num">${l.days}</td>
         <td class="small">${esc(l.reason||'')}</td><td><span class="pill ${l.status}">${l.status}</span></td>
         <td class="right">${l.status==='PENDING'&&canDecide?`<button class="btn ok sm" data-ap="${l.id}">Approve</button> <button class="btn bad sm" data-rj="${l.id}">Reject</button>`:`<span class="small muted">${esc(l.decided_by_name||'')}</span>`}</td></tr>`).join('');
-      $('#lList').innerHTML = `<div class="card"><table><thead><tr><th>Worker</th><th>Type</th><th>Period</th><th class="num">Days</th><th>Reason</th><th>Status</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`;
+      $('#lList').innerHTML = `<div class="card"><table><thead><tr><th>Blue Collar</th><th>Type</th><th>Period</th><th class="num">Days</th><th>Reason</th><th>Status</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`;
       const decide = async (id, decision) => { let remarks=''; if(decision==='REJECT') remarks=prompt('Reason (optional):')||''; try { await api(`/leave/${id}/decision`,{method:'POST',body:{decision,remarks}}); toast('Leave '+decision.toLowerCase()+'d','ok'); loadList(); refreshBadges(); } catch(e){ toast(e.message,'bad'); } };
       $('#lList').querySelectorAll('[data-ap]').forEach(b=>b.addEventListener('click',()=>decide(b.dataset.ap,'APPROVE')));
       $('#lList').querySelectorAll('[data-rj]').forEach(b=>b.addEventListener('click',()=>decide(b.dataset.rj,'REJECT')));
@@ -1607,10 +1791,10 @@ ROUTES.leave = async function () {
     $('#bYear').addEventListener('change', loadBal); loadBal();
     async function loadBal() {
       const d = await api('/leave/balances?year='+$('#bYear').value);
-      if (!d.workers.length) { $('#balTable').innerHTML = `<div class="card empty">No active workers.</div>`; return; }
+      if (!d.workers.length) { $('#balTable').innerHTML = `<div class="card empty">No active Blue Collars.</div>`; return; }
       const th = d.types.map(t => `<th class="num">${t}</th>`).join('');
       const rows = d.workers.map(w => `<tr><td>${esc(w.name)}<div class="small muted">${esc(w.department||'')}</div></td>${w.byType.map(b=>`<td class="num" title="entitlement ${b.entitlement} · taken ${b.taken}">${b.balance}<span class="small muted">/${b.entitlement}</span></td>`).join('')}</tr>`).join('');
-      $('#balTable').innerHTML = `<div class="card"><table><thead><tr><th>Worker</th>${th}</tr></thead><tbody>${rows}</tbody></table><p class="small muted" style="margin-top:8px">Each cell: remaining / entitlement. Annual policy editable in Settings.</p></div>`;
+      $('#balTable').innerHTML = `<div class="card"><table><thead><tr><th>Blue Collar</th>${th}</tr></thead><tbody>${rows}</tbody></table><p class="small muted" style="margin-top:8px">Each cell: remaining / entitlement. Annual policy editable in Settings.</p></div>`;
     }
   }
 };
@@ -1638,11 +1822,11 @@ ROUTES.compliance = async function () {
     loadW();
     async function loadW() {
       W = await api('/compliance/wage-register?month='+($('#wgMonth').value||monthStr()));
-      if (!W.rows.length) { $('#wgBody').innerHTML = `<div class="card empty">No active workers.</div>`; return; }
+      if (!W.rows.length) { $('#wgBody').innerHTML = `<div class="card empty">No active Blue Collars.</div>`; return; }
       const t = W.totals;
       const rows = W.rows.map(r => `<tr><td>${esc(r.roll_no||'')}</td><td>${esc(r.name)}<div class="small muted">${esc(r.department||'')}</div></td><td class="num">${r.present_days}</td><td class="num">${inr(r.gross)}</td><td class="num">${inr(r.ot_pay)}</td><td class="num">−${fmt(r.pf)}</td><td class="num">−${fmt(r.esi)}</td><td class="num"><b>${inr(r.net)}</b></td></tr>`).join('');
       $('#wgBody').innerHTML = `<div class="card"><div class="printonly"><h2 style="margin:0">Wage Register — ${esc(W.month)}</h2><div class="muted small">${esc(State.cfg.company.provider)} · standard ${W.std_days} days</div></div>
-        <table><thead><tr><th>Roll</th><th>Worker</th><th class="num">Present</th><th class="num">Gross</th><th class="num">OT</th><th class="num">PF</th><th class="num">ESI</th><th class="num">Net</th></tr></thead><tbody>${rows}
+        <table><thead><tr><th>Roll</th><th>Blue Collar</th><th class="num">Present</th><th class="num">Gross</th><th class="num">OT</th><th class="num">PF</th><th class="num">ESI</th><th class="num">Net</th></tr></thead><tbody>${rows}
         <tr style="font-weight:700;background:#f8fafc"><td colspan="2">TOTAL</td><td class="num">${t.present}</td><td class="num">${inr(t.gross)}</td><td class="num">${inr(t.ot)}</td><td class="num">−${fmt(t.pf)}</td><td class="num">−${fmt(t.esi)}</td><td class="num">${inr(t.net)}</td></tr>
         </tbody></table><p class="small muted" style="margin-top:8px">Computed from attendance × salary structure. PF 12% of basic; ESI 0.75% of gross (≤ ₹21,000). Costs/policy in Settings.</p></div>`;
     }
@@ -1662,7 +1846,7 @@ ROUTES.compliance = async function () {
       const d = await api('/compliance/document-expiry?days='+$('#dDays').value);
       if (!d.documents.length) { $('#dxBody').innerHTML = `<div class="card empty">No documents expiring in this window. ✓</div>`; return; }
       const rows = d.documents.map(x => `<tr><td>${esc(x.worker_name)}<div class="small muted">${esc(x.roll_no||'')} · ${esc(x.department||'')}</div></td><td>${esc(x.doc_type||'')}</td><td>${esc(x.expiry_date)}</td><td><span class="pill ${x.expired?'bad':'PENDING'}">${x.expired?'EXPIRED':'Expiring'}</span></td><td class="right"><a href="${x.url}" target="_blank" class="btn ghost sm">View</a></td></tr>`).join('');
-      $('#dxBody').innerHTML = `<div class="card"><table><thead><tr><th>Worker</th><th>Document</th><th>Expiry</th><th>Status</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`;
+      $('#dxBody').innerHTML = `<div class="card"><table><thead><tr><th>Blue Collar</th><th>Document</th><th>Expiry</th><th>Status</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`;
     }
   }
 };

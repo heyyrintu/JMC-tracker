@@ -19,6 +19,10 @@ const { getSetting, setSetting } = require('./lib/prisma');
 const { seed } = require('./prisma/seed');
 const config = require('./config');
 const calc = require('./calc');
+const reports = require('./lib/reports');
+const alerts = require('./lib/alerts');
+const pdf = require('./lib/pdf');
+const mailer = require('./lib/mailer');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -61,6 +65,13 @@ app.use(cookieParser());
 // documents). They must never be world-readable: require a valid session, and
 // restrict worker photos/documents (wphoto_ / wdoc_ prefixes) to Drona HR roles
 // so the JMC client can only ever load daily-entry attachment photos.
+// Liveness/readiness probe for the host (Coolify health check). Cheap DB
+// round-trip so an unreachable database is reported as unhealthy.
+app.get('/healthz', async (req, res) => {
+  try { await prisma.$queryRawUnsafe('SELECT 1'); res.json({ status: 'ok' }); }
+  catch (e) { res.status(503).json({ status: 'db_unreachable' }); }
+});
+
 app.get('/uploads/:file', auth, (req, res) => {
   const file = path.basename(String(req.params.file || '')); // strip any traversal
   const full = path.join(UPLOAD_DIR, file);
@@ -81,7 +92,7 @@ function audit(userId, action, detail) {
 function publicUser(u) {
   if (!u) return null;
   return { id: u.id, name: u.name, username: u.username, role: u.role, company: u.company,
-           roleLabel: config.ROLES[u.role] || u.role };
+           email: u.email || null, roleLabel: config.ROLES[u.role] || u.role };
 }
 async function currentUser(req) {
   const token = req.cookies.sid;
@@ -139,7 +150,9 @@ app.post('/api/login', async (req, res) => {
   if (!loginThrottle(ip))
     return res.status(429).json({ error: 'Too many login attempts — try again later' });
   const { username, password } = req.body || {};
-  const u = await db.prepare('SELECT * FROM users WHERE username = ? AND active = true').get((username || '').trim());
+  // Accept either a username or an email address as the login identifier.
+  const ident = (username || '').trim();
+  const u = await db.prepare('SELECT * FROM users WHERE active = true AND (username = ? OR lower(email) = lower(?))').get(ident, ident);
   // Always run a bcrypt comparison (real or dummy) for constant-ish timing.
   const ok = bcrypt.compareSync(password || '', u ? u.password_hash : DUMMY_HASH);
   if (!u || !ok)
@@ -156,6 +169,60 @@ app.post('/api/login', async (req, res) => {
 app.post('/api/logout', auth, async (req, res) => {
   await db.prepare('DELETE FROM sessions WHERE token = ?').run(req.cookies.sid);
   res.clearCookie('sid');
+  res.json({ ok: true });
+});
+
+// ---- Password reset via emailed OTP ---------------------------------------
+const OTP_TTL_MIN = 10;
+// Per-IP throttle for the public reset endpoints (zero-dependency, resets on restart).
+const otpHits = new Map();
+function otpAllowed(ip) {
+  const now = Date.now(); const r = otpHits.get(ip);
+  if (!r || now - r.first > 15 * 60 * 1000) { otpHits.set(ip, { first: now, count: 1 }); return true; }
+  r.count++; return r.count <= 5;
+}
+// Look a user up by username OR email (case-insensitive email), active only.
+function findByIdent(ident) {
+  return db.prepare("SELECT * FROM users WHERE active = true AND (username = ? OR lower(email) = lower(?))").get(ident, ident);
+}
+
+// Step 1 — request a code. Always responds generically so it can't be used to
+// probe which usernames/emails exist (anti-enumeration).
+app.post('/api/forgot-password', async (req, res) => {
+  const ip = req.ip || 'unknown';
+  if (!otpAllowed(ip)) return res.status(429).json({ error: 'Too many requests — try again later' });
+  const ident = String((req.body || {}).ident || '').trim();
+  if (!ident) return res.status(400).json({ error: 'Enter your username or email' });
+  const u = await findByIdent(ident);
+  if (u && u.email && mailer.isConfigured()) {
+    const otp = String(Math.floor(100000 + Math.random() * 900000)); // 6 digits
+    await db.prepare(`UPDATE users SET reset_otp_hash=?, reset_otp_expires = now() + interval '${OTP_TTL_MIN} minutes' WHERE id=?`)
+      .run(bcrypt.hashSync(otp, 10), u.id);
+    mailer.sendMail({ to: u.email, subject: '[Drona] Your password reset code',
+      html: `<p>Hi ${u.name},</p><p>Your password reset code is <b style="font-size:22px;letter-spacing:3px">${otp}</b></p>
+        <p>It expires in ${OTP_TTL_MIN} minutes. If you didn't request this, you can ignore this email.</p>` })
+      .catch(e => console.error('OTP mail failed:', e.message));
+    audit(u.id, 'OTP_REQUEST');
+  }
+  res.json({ ok: true, message: 'If a matching account with an email exists, a reset code has been sent.' });
+});
+
+// Step 2 — verify the code and set a new password. Revokes all sessions.
+app.post('/api/reset-password', async (req, res) => {
+  const ip = req.ip || 'unknown';
+  if (!otpAllowed(ip)) return res.status(429).json({ error: 'Too many attempts — try again later' });
+  const b = req.body || {};
+  const ident = String(b.ident || '').trim(), otp = String(b.otp || '').trim(), password = b.password || '';
+  if (!ident || !otp || !password) return res.status(400).json({ error: 'All fields are required' });
+  if (password.length < 5) return res.status(400).json({ error: 'Password must be at least 5 characters' });
+  const u = await findByIdent(ident);
+  const valid = u && u.reset_otp_hash && u.reset_otp_expires
+    && new Date(u.reset_otp_expires) > new Date() && bcrypt.compareSync(otp, u.reset_otp_hash);
+  if (!valid) return res.status(400).json({ error: 'Invalid or expired code' });
+  await db.prepare('UPDATE users SET password_hash=?, reset_otp_hash=NULL, reset_otp_expires=NULL WHERE id=?')
+    .run(bcrypt.hashSync(password, 10), u.id);
+  await db.prepare('DELETE FROM sessions WHERE user_id=?').run(u.id); // sign out everywhere
+  audit(u.id, 'PASSWORD_RESET');
   res.json({ ok: true });
 });
 
@@ -203,15 +270,9 @@ async function clientConfig(user) {
   if (user && (user.role === 'ADMIN' || user.role === 'HQ')) {
     cfg.costs = await getSetting('costs', config.COSTS);
     cfg.invoice = await getSetting('invoice', config.INVOICE);
+    cfg.alerts = await getSetting('alerts', config.ALERTS);
   }
   return cfg;
-}
-
-// Resolve a transport trip's rate from the configured route table.
-async function transportRate(from, to, vehicle) {
-  const rates = await getSetting('transport_rates', config.TRANSPORT_RATES);
-  const m = rates.find(r => r.from === from && r.to === to && r.vehicle === vehicle);
-  return m ? m.rate : null;
 }
 
 // ---- Entry assembly -------------------------------------------------------
@@ -370,6 +431,7 @@ app.post('/api/entries', auth, requireRole('OPERATOR', 'ADMIN'), async (req, res
   try {
     const id = await run();
     audit(req.user.id, b.submit ? 'ENTRY_SUBMIT' : 'ENTRY_SAVE', { date: b.work_date });
+    if (b.submit) alerts.notifyRealtime('ENTRY_SUBMITTED', { work_date: b.work_date, by: req.user.name });
     res.json({ entry: await loadEntry(id) });
   } catch (err) {
     res.status(err.http || 500).json({ error: err.message });
@@ -469,6 +531,7 @@ app.post('/api/entries/:id/decision', auth, requireRole('JMC_APPROVER', 'ADMIN')
               jmc_remarks=?, updated_at=now() WHERE id=?`)
     .run(status, req.user.id, remarks || null, e.id);
   audit(req.user.id, 'ENTRY_' + status, { date: e.work_date, remarks });
+  if (status === 'APPROVED') alerts.notifyRealtime('PNL_NEGATIVE', {});
   res.json({ entry: await loadEntry(e.id) });
 });
 
@@ -495,6 +558,7 @@ app.post('/api/manpower-requests', auth, requireRole('OPERATOR', 'ADMIN'), async
     .get(today, b.needed_date || null, b.category, Number(b.extra_count), b.reason || null,
          b.ppm_current != null ? Number(b.ppm_current) : null, req.user.id);
   audit(req.user.id, 'MP_REQUEST', { id: row.id });
+  alerts.notifyRealtime('MP_REQUEST', { by: req.user.name, category: b.category, extra_count: Number(b.extra_count), reason: b.reason });
   res.json({ id: row.id });
 });
 
@@ -545,71 +609,15 @@ app.get('/api/summary', auth, async (req, res) => {
     open_discrepancies: (await db.prepare("SELECT COUNT(*)::int c FROM discrepancies WHERE status='OPEN'").get()).c,
     pending_leaves: (await db.prepare("SELECT COUNT(*)::int c FROM leave_applications WHERE status='PENDING'").get()).c,
     pending_onboarding: (await db.prepare("SELECT COUNT(*)::int c FROM workers WHERE onboard_status='PENDING'").get()).c,
-    expiring_docs: (await db.prepare("SELECT COUNT(*)::int c FROM worker_documents WHERE expiry_date IS NOT NULL AND expiry_date <= ?").get(docCutoff)).c });
+    expiring_docs: (await db.prepare("SELECT COUNT(*)::int c FROM worker_documents WHERE expiry_date IS NOT NULL AND expiry_date <= ?").get(docCutoff)).c,
+    open_capa: (await db.prepare("SELECT COUNT(*)::int c FROM capa WHERE status NOT IN ('DONE','VERIFIED')").get()).c,
+    overdue_capa: (await db.prepare("SELECT COUNT(*)::int c FROM capa WHERE status NOT IN ('DONE','VERIFIED') AND due_date IS NOT NULL AND due_date < ?").get(new Date().toISOString().slice(0,10))).c });
 });
 
 // ---- Billing / Invoice / P&L (Drona internal) -----------------------------
 app.get('/api/billing', auth, requireRole('ADMIN', 'HQ'), async (req, res) => {
   const month = req.query.month || new Date().toISOString().slice(0, 7);
-  const rates = await getSetting('rates', config.RATES);
-  const mg = (await getSetting('mg', config.MG)).qc_daily_parts;
-  const mgBilling = !!(await getSetting('mg_billing', config.MG_BILLING));
-  const costs = await getSetting('costs', config.COSTS);
-  const invoice = await getSetting('invoice', config.INVOICE);
-
-  // Quantities
-  const agg = await db.prepare(`SELECT
-      COALESCE(SUM(l.parts_qty),0)::float load_parts,
-      COALESCE(SUM(u.weight_ton),0)::float unload_ton
-    FROM daily_entries e
-    LEFT JOIN loading l ON l.entry_id = e.id
-    LEFT JOIN unloading u ON u.entry_id = e.id
-    WHERE substr(e.work_date,1,7) = ?`).get(month);
-
-  // QC per day (for MG floor)
-  const qcDaysRows = await db.prepare(`SELECT q.parts_qty FROM qc q JOIN daily_entries e ON e.id=q.entry_id
-    WHERE substr(e.work_date,1,7) = ? AND q.parts_qty > 0`).all(month);
-  const qcCalc = calc.qcBilled(qcDaysRows.map(r => r.parts_qty), mg, mgBilling);
-  const qcActualQty = qcCalc.actual, qcBilledQty = qcCalc.billed, qcMgUplift = qcCalc.uplift;
-
-  const loadingRev = agg.load_parts * rates.loading.rate;
-  const unloadingRev = agg.unload_ton * rates.unloading.rate;
-  const qcRev = qcBilledQty * rates.qc.rate;
-  const serviceRev = loadingRev + unloadingRev + qcRev;
-
-  // Transport billing per trip
-  const trips = await db.prepare(`SELECT from_loc, to_loc, vehicle_type FROM transport_trips t
-    JOIN daily_entries e ON e.id=t.entry_id WHERE substr(e.work_date,1,7) = ?`).all(month);
-  const routeMap = {};
-  let transportRev = 0, unknownTrips = 0;
-  for (const t of trips) {
-    const r = await transportRate(t.from_loc, t.to_loc, t.vehicle_type);
-    const key = `${t.from_loc} → ${t.to_loc} (${t.vehicle_type})`;
-    routeMap[key] = routeMap[key] || { route: key, trips: 0, rate: r, amount: 0, known: r != null };
-    routeMap[key].trips++;
-    if (r != null) { routeMap[key].amount += r; transportRev += r; } else unknownTrips++;
-  }
-  const totalRev = serviceRev + transportRev;
-
-  // Costs / P&L
-  const transportCost = costs.transport_monthly && costs.transport_monthly > 0 ? costs.transport_monthly : transportRev;
-  const totalCost = (costs.manpower_monthly || 0) + (costs.overhead_monthly || 0) + transportCost;
-  const grossProfit = totalRev - totalCost;
-  const margin = totalRev ? grossProfit / totalRev : 0;
-
-  // Invoice
-  const subtotal = totalRev;
-  const gstPct = invoice.gst_pct || 0;
-  const { gst_amt: gstAmt, grand_total: grandTotal } = calc.gst(subtotal, gstPct);
-
-  res.json({
-    month, rates, mg, mgBilling,
-    quantities: { load_parts: agg.load_parts, unload_ton: agg.unload_ton, qc_actual: qcActualQty, qc_billed: qcBilledQty, qc_mg_uplift: qcMgUplift },
-    revenue: { loading: loadingRev, unloading: unloadingRev, qc: qcRev, service: serviceRev, transport: transportRev, total: totalRev },
-    transport_routes: Object.values(routeMap), unknown_trips: unknownTrips,
-    pnl: { revenue: totalRev, manpower: costs.manpower_monthly || 0, overhead: costs.overhead_monthly || 0, transport: transportCost, total_cost: totalCost, gross_profit: grossProfit, margin },
-    invoice: { bill_to: invoice.bill_to, gstin: invoice.gstin || '', notes: invoice.notes || '', subtotal, gst_pct: gstPct, gst_amt: gstAmt, grand_total: grandTotal },
-  });
+  res.json(await reports.computeBilling(month));
 });
 
 // ---- MIS (management dashboard aggregation) -------------------------------
@@ -707,23 +715,25 @@ app.put('/api/settings', auth, requireRole('ADMIN'), async (req, res) => {
   if (typeof b.mgBilling === 'boolean') await setSetting('mg_billing', b.mgBilling);
   if (b.transportRates) await setSetting('transport_rates', b.transportRates);
   if (b.leavePolicy) await setSetting('leave_policy', b.leavePolicy);
+  if (b.alerts) await setSetting('alerts', b.alerts);
   audit(req.user.id, 'SETTINGS_UPDATE');
   res.json({ config: await clientConfig(req.user) });
 });
 
 app.get('/api/users', auth, requireRole('ADMIN'), async (req, res) => {
-  res.json({ users: await db.prepare('SELECT id, name, username, role, company, active FROM users ORDER BY id').all() });
+  res.json({ users: await db.prepare('SELECT id, name, username, role, company, active, email FROM users ORDER BY id').all() });
 });
 
 app.post('/api/users', auth, requireRole('ADMIN'), async (req, res) => {
-  const { name, username, password, role, company } = req.body || {};
+  const { name, username, password, role, company, email } = req.body || {};
   if (!name || !username || !password || !role || !company)
     return res.status(400).json({ error: 'All fields required' });
   if (password.length < 5) return res.status(400).json({ error: 'Password must be at least 5 characters' });
   if (!config.ROLES[role]) return res.status(400).json({ error: 'Invalid role' });
+  if (email && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return res.status(400).json({ error: 'Invalid email address' });
   try {
-    await db.prepare(`INSERT INTO users (name, username, password_hash, role, company) VALUES (?,?,?,?,?)`)
-      .run(name, username.trim(), bcrypt.hashSync(password, 10), role, company);
+    await db.prepare(`INSERT INTO users (name, username, password_hash, role, company, email) VALUES (?,?,?,?,?,?)`)
+      .run(name, username.trim(), bcrypt.hashSync(password, 10), role, company, email ? email.trim() : null);
     audit(req.user.id, 'USER_CREATE', { username });
     res.json({ ok: true });
   } catch (e) {
@@ -748,6 +758,15 @@ app.post('/api/users/:id/reset-password', auth, requireRole('ADMIN'), async (req
   const { password } = req.body || {};
   if (!password || password.length < 5) return res.status(400).json({ error: 'Password too short' });
   await db.prepare('UPDATE users SET password_hash=? WHERE id=?').run(bcrypt.hashSync(password, 10), Number(req.params.id));
+  res.json({ ok: true });
+});
+
+// Set / update a user's email (needed for OTP password reset to reach them).
+app.post('/api/users/:id/email', auth, requireRole('ADMIN'), async (req, res) => {
+  const email = String((req.body || {}).email || '').trim();
+  if (email && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return res.status(400).json({ error: 'Invalid email address' });
+  await db.prepare('UPDATE users SET email=? WHERE id=?').run(email || null, Number(req.params.id));
+  audit(req.user.id, 'USER_EMAIL_SET', { id: Number(req.params.id) });
   res.json({ ok: true });
 });
 
@@ -1287,6 +1306,96 @@ app.post('/api/pdi-parts/import', auth, requireRole('ADMIN'), async (req, res) =
   res.json({ added, updated, total: tokens.length });
 });
 
+// ---- Email alerts ---------------------------------------------------------
+app.post('/api/alerts/test', auth, requireRole('ADMIN'), async (req, res) => {
+  const a = await getSetting('alerts', config.ALERTS);
+  const to = (req.body && req.body.to) || a.recipients;
+  if (!to) return res.status(400).json({ error: 'No recipients configured' });
+  if (!mailer.isConfigured()) return res.status(400).json({ error: 'SMTP is not configured (set SMTP_HOST etc. in .env)' });
+  const result = await mailer.sendMail({ to, subject: '[Drona] Test alert email',
+    html: '<p>This is a test alert from the JMC Operations Tracker. If you received this, SMTP is working.</p>' });
+  audit(req.user.id, 'ALERT_TEST', { to });
+  res.json({ ok: true, result });
+});
+
+app.get('/api/alerts/preview', auth, requireRole('ADMIN', 'HQ'), async (req, res) => {
+  const month = req.query.month || new Date().toISOString().slice(0, 7);
+  res.json({ month, smtp_configured: mailer.isConfigured(), items: await alerts.evaluate(month) });
+});
+
+// Send the daily operations summary immediately (test / on-demand).
+app.post('/api/alerts/summary-now', auth, requireRole('ADMIN'), async (req, res) => {
+  if (!mailer.isConfigured()) return res.status(400).json({ error: 'SMTP is not configured (set SMTP_HOST etc. in .env)' });
+  const result = await alerts.runDailySummary(true);
+  audit(req.user.id, 'SUMMARY_SEND');
+  res.json({ ok: true, result });
+});
+
+// ---- PDF: monthly report + GST invoice (Drona internal) -------------------
+app.get('/api/reports/monthly.pdf', auth, requireRole('ADMIN', 'HQ'), async (req, res) => {
+  const month = req.query.month || new Date().toISOString().slice(0, 7);
+  const [ops, billing] = await Promise.all([reports.computeOps(month), reports.computeBilling(month)]);
+  pdf.streamMonthlyReport(res, { month, ops, billing });
+});
+
+app.get('/api/invoice.pdf', auth, requireRole('ADMIN', 'HQ'), async (req, res) => {
+  const month = req.query.month || new Date().toISOString().slice(0, 7);
+  const billing = await reports.computeBilling(month);
+  const invoice = await getSetting('invoice', config.INVOICE);
+  const invoiceNo = req.query.no || `DRN/${month}`;
+  pdf.streamInvoice(res, { month, billing, invoice, invoiceNo });
+});
+
+// ---- CAPA / 8D ------------------------------------------------------------
+app.get('/api/capa', auth, async (req, res) => {
+  const { status } = req.query;
+  let sql = `SELECT c.*, d.type AS disc_type, d.part_no AS disc_part_no, u.name AS created_by_name,
+      (c.due_date IS NOT NULL AND c.due_date < ? AND c.status NOT IN ('DONE','VERIFIED')) AS overdue
+    FROM capa c
+    LEFT JOIN discrepancies d ON d.id = c.discrepancy_id
+    LEFT JOIN users u ON u.id = c.created_by WHERE 1=1`;
+  const args = [new Date().toISOString().slice(0, 10)];
+  if (status) { sql += ' AND c.status = ?'; args.push(status); }
+  sql += ` ORDER BY CASE c.status WHEN 'OPEN' THEN 0 WHEN 'IN_PROGRESS' THEN 1 WHEN 'DONE' THEN 2 ELSE 3 END,
+           c.due_date NULLS LAST, c.id DESC LIMIT 500`;
+  res.json({ capa: await db.prepare(sql).all(...args) });
+});
+
+app.post('/api/capa', auth, requireRole('OPERATOR', 'JMC_APPROVER', 'HQ', 'ADMIN'), async (req, res) => {
+  const b = req.body || {};
+  if (!b.title || !String(b.title).trim()) return res.status(400).json({ error: 'Title is required' });
+  const priority = ['LOW', 'MEDIUM', 'HIGH'].includes(b.priority) ? b.priority : 'MEDIUM';
+  const row = await db.prepare(`INSERT INTO capa
+    (discrepancy_id, title, root_cause, corrective_action, preventive_action, owner, due_date, priority, created_by)
+    VALUES (?,?,?,?,?,?,?,?,?) RETURNING id`)
+    .get(b.discrepancy_id != null && b.discrepancy_id !== '' ? Number(b.discrepancy_id) : null,
+      String(b.title).trim(), b.root_cause || null, b.corrective_action || null, b.preventive_action || null,
+      b.owner || null, b.due_date || null, priority, req.user.id);
+  audit(req.user.id, 'CAPA_CREATE', { id: row.id });
+  res.json({ id: row.id });
+});
+
+app.put('/api/capa/:id', auth, requireRole('OPERATOR', 'JMC_APPROVER', 'HQ', 'ADMIN'), async (req, res) => {
+  const c = await db.prepare('SELECT * FROM capa WHERE id=?').get(Number(req.params.id));
+  if (!c) return res.status(404).json({ error: 'Not found' });
+  const b = req.body || {};
+  const status = ['OPEN', 'IN_PROGRESS', 'DONE', 'VERIFIED'].includes(b.status) ? b.status : c.status;
+  if (status === 'VERIFIED' && !['HQ', 'ADMIN'].includes(req.user.role))
+    return res.status(403).json({ error: 'Only HQ / Admin can verify a CAPA' });
+  const priority = ['LOW', 'MEDIUM', 'HIGH'].includes(b.priority) ? b.priority : c.priority;
+  const closing = (status === 'DONE' || status === 'VERIFIED');
+  await db.prepare(`UPDATE capa SET title=?, root_cause=?, corrective_action=?, preventive_action=?, owner=?,
+      due_date=?, priority=?, status=?, verification_remarks=?,
+      closed_at = CASE WHEN ? AND closed_at IS NULL THEN now() WHEN ? THEN NULL ELSE closed_at END,
+      updated_at=now() WHERE id=?`)
+    .run(b.title != null ? String(b.title).trim() : c.title, b.root_cause ?? c.root_cause,
+      b.corrective_action ?? c.corrective_action, b.preventive_action ?? c.preventive_action,
+      b.owner ?? c.owner, b.due_date ?? c.due_date, priority, status, b.verification_remarks ?? c.verification_remarks,
+      closing, !closing, c.id);
+  audit(req.user.id, 'CAPA_UPDATE', { id: c.id, status });
+  res.json({ ok: true });
+});
+
 // ---- Static frontend ------------------------------------------------------
 app.use(express.static(path.join(__dirname, 'public')));
 app.get('*', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
@@ -1306,6 +1415,7 @@ setInterval(pruneSessions, 60 * 60 * 1000).unref();
 // Ensure defaults exist, then start listening.
 async function start() {
   try { await seed(); } catch (e) { console.error('Seed on boot failed:', e.message); }
+  alerts.startScheduler();
   app.listen(PORT, () => {
     console.log(`\n  Drona ValueChain — JMC Ops Tracker`);
     console.log(`  Running at http://localhost:${PORT}\n`);
