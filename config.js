@@ -76,6 +76,21 @@ module.exports = {
   // Bill QC at the guaranteed minimum (max of actual vs MG) per operating day.
   MG_BILLING: true,
 
+  // ---- Email alerts -------------------------------------------------------
+  // Admin-editable from Settings (stored under setting key 'alerts'). SMTP
+  // transport itself is configured via env vars (SMTP_HOST/PORT/USER/PASS,
+  // ALERT_FROM) — see .env.example. `recipients` is a comma-separated list.
+  ALERTS: {
+    enabled: false,
+    recipients: '',          // "ops@drona.com, hq@drona.com"
+    digest_hour: 2,          // local hour (0-23) the nightly digest is sent
+    pnl_day_threshold: 20,   // only flag a negative P&L after this day-of-month
+    pending_approvals_max: 3,// alert when submitted-but-unapproved days exceed this
+    pending_mp_max: 1,       // alert when pending manpower requests exceed this
+    doc_expiry_days: 45,     // alert on worker documents expiring within N days
+    mg_short_days_max: 1,    // alert when QC days below MG exceed this
+  },
+
   // ---- Offer letter (generated after HQ approval) -------------------------
   // Editable by an ADMIN later from Settings (stored under setting key 'offer').
   OFFER: {
