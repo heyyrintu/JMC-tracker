@@ -65,6 +65,13 @@ app.use(cookieParser());
 // documents). They must never be world-readable: require a valid session, and
 // restrict worker photos/documents (wphoto_ / wdoc_ prefixes) to Drona HR roles
 // so the JMC client can only ever load daily-entry attachment photos.
+// Liveness/readiness probe for the host (Coolify health check). Cheap DB
+// round-trip so an unreachable database is reported as unhealthy.
+app.get('/healthz', async (req, res) => {
+  try { await prisma.$queryRawUnsafe('SELECT 1'); res.json({ status: 'ok' }); }
+  catch (e) { res.status(503).json({ status: 'db_unreachable' }); }
+});
+
 app.get('/uploads/:file', auth, (req, res) => {
   const file = path.basename(String(req.params.file || '')); // strip any traversal
   const full = path.join(UPLOAD_DIR, file);

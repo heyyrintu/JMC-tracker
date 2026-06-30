@@ -1,0 +1,17 @@
+# Keep the image small and never bake secrets / local data into it.
+node_modules
+npm-debug.log
+.git
+.gitignore
+.env
+.env.*
+!.env.example
+uploads
+data.sqlite
+data.sqlite-shm
+data.sqlite-wal
+*.log
+FEATURES_SPEC.md
+RENAME_SPEC.md
+.claude
+test
