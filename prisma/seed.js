@@ -28,6 +28,7 @@ async function seed() {
   await ensureSetting('defect_types', config.DEFECT_TYPES);
   await ensureSetting('mg_billing', config.MG_BILLING);
   await ensureSetting('leave_policy', config.LEAVE_POLICY);
+  await ensureSetting('alerts', config.ALERTS);
 
   // PDI parts master — load the imported sheet once.
   if ((await prisma.pdiPart.count()) === 0) {

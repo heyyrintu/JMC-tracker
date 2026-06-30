@@ -29,16 +29,17 @@ function toast(msg, kind = '') {
 }
 
 const ROLE_NAV = {
-  OPERATOR:     ['dashboard','entry','workers','onboarding','attendance','leave','compliance','discrepancies','requests','reports','mis'],
-  JMC_APPROVER: ['dashboard','approvals','discrepancies','reports','mis'],
-  HQ:           ['dashboard','workers','onboarding','attendance','leave','compliance','discrepancies','requests','reports','mis','billing'],
-  ADMIN:        ['dashboard','entry','workers','onboarding','attendance','leave','compliance','approvals','discrepancies','requests','reports','mis','billing','settings','users','audit'],
+  OPERATOR:     ['dashboard','entry','workers','onboarding','attendance','leave','compliance','discrepancies','capa','requests','reports','mis'],
+  JMC_APPROVER: ['dashboard','approvals','discrepancies','capa','reports','mis'],
+  HQ:           ['dashboard','workers','onboarding','attendance','leave','compliance','discrepancies','capa','requests','reports','mis','billing'],
+  ADMIN:        ['dashboard','entry','workers','onboarding','attendance','leave','compliance','approvals','discrepancies','capa','requests','reports','mis','billing','settings','users','audit'],
 };
 const NAV_META = {
   dashboard:{ic:'▤',label:'Dashboard'}, entry:{ic:'✎',label:'Daily Entry'},
   workers:{ic:'⚇',label:'Workers'}, onboarding:{ic:'🪪',label:'Onboarding'}, attendance:{ic:'🗓',label:'Attendance'},
   leave:{ic:'🏖',label:'Leave'}, compliance:{ic:'⚖',label:'Compliance'},
   approvals:{ic:'✔',label:'EOD Approvals'}, discrepancies:{ic:'⚠',label:'Discrepancies'},
+  capa:{ic:'🛠',label:'CAPA / 8D'},
   requests:{ic:'＋',label:'Manpower Requests'},
   reports:{ic:'▦',label:'Reports'}, mis:{ic:'▣',label:'MIS Dashboard'}, billing:{ic:'₹',label:'Billing'},
   settings:{ic:'⚙',label:'Settings'}, users:{ic:'◐',label:'Users'},
@@ -138,6 +139,7 @@ async function refreshBadges() {
     if (['HQ','ADMIN'].includes(State.user.role)) set('requests', s.pending_mp_requests);
     if (['HQ','ADMIN'].includes(State.user.role)) set('onboarding', s.pending_onboarding);
     set('discrepancies', s.open_discrepancies);
+    set('capa', s.overdue_capa);
     if (['HQ','ADMIN'].includes(State.user.role)) set('leave', s.pending_leaves);
     set('compliance', s.expiring_docs);
   } catch (_) {}
@@ -778,6 +780,80 @@ ROUTES.reports = async function () {
 // ===========================================================================
 // SETTINGS (Admin)
 // ===========================================================================
+// ===========================================================================
+// CAPA / 8D  (corrective & preventive actions)
+// ===========================================================================
+const CAPA_STATUS = ['OPEN','IN_PROGRESS','DONE','VERIFIED'];
+function capaModal(prefill = {}, onSaved) {
+  const isEdit = !!prefill.id;
+  const prioOpt = (v)=>['LOW','MEDIUM','HIGH'].map(s=>`<option ${s===(v||'MEDIUM')?'selected':''}>${s}</option>`).join('');
+  const statusOpt = (v)=>CAPA_STATUS.map(s=>`<option ${s===(v||'OPEN')?'selected':''}>${s}</option>`).join('');
+  const canVerify = ['HQ','ADMIN'].includes(State.user.role);
+  const ov = h(`<div class="modal-backdrop"><div class="modal" style="max-width:560px">
+    <h3>${isEdit?'Edit CAPA / 8D':'New CAPA / 8D'}</h3>
+    <div class="field"><label>Title</label><input id="cpTitle" value="${esc(prefill.title||'')}"></div>
+    <div class="grid g2">
+      <div class="field"><label>Owner</label><input id="cpOwner" value="${esc(prefill.owner||'')}"></div>
+      <div class="field"><label>Due date</label><input type="date" id="cpDue" value="${esc(prefill.due_date||'')}"></div>
+      <div class="field"><label>Priority</label><select id="cpPrio">${prioOpt(prefill.priority)}</select></div>
+      ${isEdit?`<div class="field"><label>Status</label><select id="cpStatus">${statusOpt(prefill.status)}</select></div>`:''}
+    </div>
+    <div class="field"><label>Root cause</label><textarea id="cpRoot" rows="2">${esc(prefill.root_cause||'')}</textarea></div>
+    <div class="field"><label>Corrective action</label><textarea id="cpCorr" rows="2">${esc(prefill.corrective_action||'')}</textarea></div>
+    <div class="field"><label>Preventive action</label><textarea id="cpPrev" rows="2">${esc(prefill.preventive_action||'')}</textarea></div>
+    ${isEdit?`<div class="field"><label>Verification remarks ${canVerify?'':'<span class="muted small">(only HQ/Admin can set VERIFIED)</span>'}</label><input id="cpVer" value="${esc(prefill.verification_remarks||'')}"></div>`:''}
+    <div class="btn-row" style="justify-content:flex-end"><button class="btn ghost" id="cpCancel">Cancel</button>
+      <button class="btn primary" id="cpSave">${isEdit?'Save':'Create CAPA'}</button></div>
+  </div></div>`);
+  document.body.appendChild(ov);
+  const close=()=>ov.remove();
+  ov.querySelector('#cpCancel').addEventListener('click', close);
+  ov.addEventListener('click', e=>{ if(e.target===ov) close(); });
+  ov.querySelector('#cpTitle').focus();
+  ov.querySelector('#cpSave').addEventListener('click', async () => {
+    const body = { title:$('#cpTitle').value, owner:$('#cpOwner').value, due_date:$('#cpDue').value,
+      priority:$('#cpPrio').value, root_cause:$('#cpRoot').value, corrective_action:$('#cpCorr').value,
+      preventive_action:$('#cpPrev').value };
+    if (!body.title.trim()) { toast('Title is required','bad'); return; }
+    if (isEdit) { body.status=$('#cpStatus').value; const ver=$('#cpVer'); if(ver) body.verification_remarks=ver.value; }
+    if (!isEdit && prefill.discrepancy_id) body.discrepancy_id = prefill.discrepancy_id;
+    try { await api(isEdit?('/capa/'+prefill.id):'/capa', { method:isEdit?'PUT':'POST', body });
+      toast(isEdit?'CAPA updated':'CAPA created','ok'); close(); if(onSaved) onSaved(); refreshBadges(); }
+    catch (e) { toast(e.message,'bad'); }
+  });
+}
+
+ROUTES.capa = async function () {
+  const v = $('#view');
+  const canCreate = ['OPERATOR','JMC_APPROVER','HQ','ADMIN'].includes(State.user.role);
+  v.innerHTML = topbar('CAPA / 8D', 'Corrective & preventive actions — close quality concerns with accountability.') +
+    `<div class="card"><div class="btn-row">
+       <label class="small" style="margin:0">Status</label>
+       <select id="cFilter" style="width:auto"><option value="">All</option>${CAPA_STATUS.map(s=>`<option value="${s}">${s.replace('_',' ')}</option>`).join('')}</select>
+       ${canCreate?`<button class="btn primary sm" id="cNew" style="margin-left:auto">＋ New CAPA</button>`:''}
+     </div></div><div id="cList"><div class="empty">Loading…</div></div>`;
+  const cNew = $('#cNew'); if (cNew) cNew.addEventListener('click', ()=>capaModal({}, load));
+  $('#cFilter').addEventListener('change', load);
+  load();
+
+  async function load() {
+    const st = $('#cFilter').value;
+    const r = await api('/capa' + (st?'?status='+st:''));
+    if (!r.capa.length) { $('#cList').innerHTML = `<div class="card empty">No CAPAs yet.</div>`; return; }
+    const stPill = s => `<span class="pill ${s==='VERIFIED'?'ok':s==='OPEN'?'bad':''}" ${s==='IN_PROGRESS'?'style="background:#dbeafe;color:#1e40af"':s==='DONE'?'style="background:#dcfce7;color:#166534"':''}>${esc(s.replace('_',' '))}</span>`;
+    const rows = r.capa.map(c => `<tr${c.overdue?' style="background:#fff1f2"':''}>
+      <td><b>${esc(c.title)}</b>${c.disc_type?`<br><span class="tag">from ${esc(c.disc_type)}${c.disc_part_no?(' '+esc(c.disc_part_no)):''}</span>`:''}</td>
+      <td>${esc(c.owner||'—')}</td>
+      <td class="small ${c.overdue?'flag':''}">${esc(c.due_date||'—')}${c.overdue?' ⚠':''}</td>
+      <td><span class="pill ${c.priority==='HIGH'?'bad':c.priority==='LOW'?'ok':''}" ${c.priority==='MEDIUM'?'style="background:#fef3c7;color:#92400e"':''}>${esc(c.priority)}</span></td>
+      <td>${stPill(c.status)}</td>
+      <td class="right"><button class="btn ghost sm" data-edit="${c.id}">Open</button></td></tr>`).join('');
+    $('#cList').innerHTML = `<div class="card"><table><thead><tr><th>Title</th><th>Owner</th><th>Due</th><th>Priority</th><th>Status</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`;
+    $('#cList').querySelectorAll('[data-edit]').forEach(b=>b.addEventListener('click', ()=>{
+      const c = r.capa.find(x=>String(x.id)===b.dataset.edit); if(c) capaModal(c, load); }));
+  }
+};
+
 ROUTES.settings = async function () {
   const v = $('#view'); const c = State.cfg;
   v.innerHTML = topbar('Settings', 'Rates, MG and approved manpower baseline.') +
@@ -810,6 +886,23 @@ ROUTES.settings = async function () {
       </div>
       <div class="field"><label>Invoice notes</label><input id="invNotes" value="${esc((c.invoice||{}).notes||'')}"></div>
       <label class="inline"><input type="checkbox" id="mgBill" ${c.mgBilling?'checked':''} style="width:auto"> Bill QC at the guaranteed minimum (MG floor per day)</label></div>
+     <div class="card"><h3>Email Alerts <span class="muted small">(SMTP via .env · recipients below)</span></h3>
+      <label class="inline"><input type="checkbox" id="alEnabled" ${(c.alerts||{}).enabled?'checked':''} style="width:auto"> Enable email alerts (nightly digest + real-time)</label>
+      <div class="field" style="margin-top:8px"><label>Recipients <span class="muted small">(comma-separated emails)</span></label>
+        <textarea id="alRecip" rows="2" placeholder="ops@drona.com, hq@drona.com">${esc((c.alerts||{}).recipients||'')}</textarea></div>
+      <div class="grid g3">
+        <div class="field"><label>Digest hour (0–23)</label><input type="number" min="0" max="23" id="alHour" value="${(c.alerts||{}).digest_hour??2}"></div>
+        <div class="field"><label>Flag P&L negative after day</label><input type="number" min="1" max="28" id="alPnlDay" value="${(c.alerts||{}).pnl_day_threshold??20}"></div>
+        <div class="field"><label>Pending approvals over</label><input type="number" min="0" id="alPa" value="${(c.alerts||{}).pending_approvals_max??3}"></div>
+        <div class="field"><label>Pending MP requests over</label><input type="number" min="0" id="alPm" value="${(c.alerts||{}).pending_mp_max??1}"></div>
+        <div class="field"><label>Doc expiry within (days)</label><input type="number" min="1" id="alDoc" value="${(c.alerts||{}).doc_expiry_days??45}"></div>
+        <div class="field"><label>MG-short days over</label><input type="number" min="0" id="alMg" value="${(c.alerts||{}).mg_short_days_max??1}"></div>
+      </div>
+      <div class="btn-row" style="margin-top:8px">
+        <button class="btn ghost sm" id="alTest">Send test email</button>
+        <button class="btn ghost sm" id="alPreview">Preview alerts now</button>
+      </div>
+      <div id="alOut" class="small" style="margin-top:8px"></div></div>
      <button class="btn primary" id="saveSet">Save settings</button>
      <div class="card" style="margin-top:16px"><h3>PDI Parts Master <span class="muted small">(part numbers suggested on QC inspection lines)</span></h3>
        <div id="pdiSummary" class="muted small">Loading…</div>
@@ -835,10 +928,26 @@ ROUTES.settings = async function () {
       costs: { manpower_monthly:+$('#costMp').value||0, overhead_monthly:+$('#costOh').value||0, transport_monthly:+$('#costTr').value||0 },
       invoice: { gst_pct:+$('#invGst').value||0, gstin:$('#invGstin').value, bill_to:$('#invBillTo').value, notes:$('#invNotes').value },
       mgBilling: $('#mgBill').checked,
+      alerts: {
+        enabled: $('#alEnabled').checked, recipients: $('#alRecip').value.trim(),
+        digest_hour: +$('#alHour').value||0, pnl_day_threshold: +$('#alPnlDay').value||0,
+        pending_approvals_max: +$('#alPa').value||0, pending_mp_max: +$('#alPm').value||0,
+        doc_expiry_days: +$('#alDoc').value||0, mg_short_days_max: +$('#alMg').value||0,
+      },
     };
     try { const r = await api('/settings', { method:'PUT', body }); State.cfg = r.config; toast('Settings saved','ok'); ROUTES.settings(); }
     catch (e) { toast(e.message,'bad'); }
   });
+  const alTest = $('#alTest'); if (alTest) alTest.addEventListener('click', async () => {
+    try { const r = await api('/alerts/test', { method:'POST', body:{} });
+      toast(r.result && r.result.skipped ? ('Skipped: '+r.result.skipped) : 'Test email sent','ok'); }
+    catch (e) { toast(e.message,'bad'); } });
+  const alPrev = $('#alPreview'); if (alPrev) alPrev.addEventListener('click', async () => {
+    try { const r = await api('/alerts/preview');
+      $('#alOut').innerHTML = r.items.length
+        ? `<b>Would alert (${r.items.length}):</b><ul style="margin:4px 0">${r.items.map(i=>`<li><span class="${i.level==='critical'?'flag':''}">${esc(i.title)}</span> — <span class="muted">${esc(i.detail||'')}</span></li>`).join('')}</ul>${r.smtp_configured?'':'<div class="flag">SMTP not configured in .env — emails are logged &amp; skipped.</div>'}`
+        : '<span class="pill ok">No alerts would fire right now.</span>'; }
+    catch (e) { toast(e.message,'bad'); } });
 
   // ---- PDI parts master management ----
   async function loadPdi() {
@@ -992,12 +1101,15 @@ ROUTES.discrepancies = async function () {
         <td>${sevPill(d.severity)}</td>
         <td><span class="pill ${d.status==='OPEN'?'bad':'ok'}">${d.status}</span></td>
         <td class="small muted">${esc(d.raised_by_name||'')} <span class="tag">${esc(d.raised_company||'')}</span></td>
-        <td class="right">${d.status==='OPEN'&&canResolve
-          ? `<button class="btn ok sm" data-res="${d.id}">Resolve</button>`
-          : (d.resolution?`<span class="small muted" title="${esc(d.resolution)}">✓ ${esc(d.resolved_by_name||'')}</span>`:'')}</td></tr>`;
+        <td class="right"><button class="btn ghost sm" data-capa="${d.id}" data-ctype="${esc(d.type)}" data-cpart="${esc(d.part_no||'')}" title="Raise a CAPA / 8D from this concern">＋ CAPA</button>
+          ${d.status==='OPEN'&&canResolve
+          ? ` <button class="btn ok sm" data-res="${d.id}">Resolve</button>`
+          : (d.resolution?` <span class="small muted" title="${esc(d.resolution)}">✓ ${esc(d.resolved_by_name||'')}</span>`:'')}</td></tr>`;
     }).join('');
     $('#dList').innerHTML = `<div class="card"><table><thead><tr><th>Date</th><th>Type</th><th>Part</th>
       <th>Detail</th><th>Severity</th><th>Status</th><th>Raised by</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`;
+    $('#dList').querySelectorAll('[data-capa]').forEach(b=>b.addEventListener('click',()=>capaModal({ discrepancy_id:b.dataset.capa,
+      title:`${DISC_TYPES[b.dataset.ctype]||b.dataset.ctype}${b.dataset.cpart?(' — '+b.dataset.cpart):''}` }, load)));
     $('#dList').querySelectorAll('[data-res]').forEach(b=>b.addEventListener('click', async ()=>{
       const resolution = prompt('Resolution / closing note:') ; if (resolution===null) return;
       try { await api(`/discrepancies/${b.dataset.res}/resolve`,{method:'POST',body:{resolution}});
@@ -1162,10 +1274,14 @@ ROUTES.billing = async function () {
   v.innerHTML = topbar('Billing & Invoice', 'Revenue, P&L and the monthly JMC invoice (Drona internal).') +
     `<div class="card noprint"><div class="btn-row">
        <label class="small" style="margin:0">Month</label><input type="month" id="bMonth" value="${monthStr()}" style="width:auto">
-       <button class="btn ghost" id="bPrint">🖨 Print invoice / PDF</button></div></div>
+       <button class="btn ghost" id="bReport">▦ Monthly report (PDF)</button>
+       <button class="btn ghost" id="bInvoice">₹ GST invoice (PDF)</button>
+       <button class="btn ghost" id="bPrint">🖨 Print</button></div></div>
      <div id="bBody"><div class="empty">Loading…</div></div>`;
   $('#bMonth').addEventListener('change', load);
   $('#bPrint').addEventListener('click', () => window.print());
+  $('#bReport').addEventListener('click', () => window.open('/api/reports/monthly.pdf?month=' + ($('#bMonth').value || monthStr()), '_blank'));
+  $('#bInvoice').addEventListener('click', () => window.open('/api/invoice.pdf?month=' + ($('#bMonth').value || monthStr()), '_blank'));
   load();
 
   async function load() {
