@@ -36,7 +36,7 @@ const ROLE_NAV = {
 };
 const NAV_META = {
   dashboard:{ic:'▤',label:'Dashboard'}, entry:{ic:'✎',label:'Daily Entry'},
-  workers:{ic:'⚇',label:'Workers'}, onboarding:{ic:'🪪',label:'Onboarding'}, attendance:{ic:'🗓',label:'Attendance'},
+  workers:{ic:'⚇',label:'Blue Collars'}, onboarding:{ic:'🪪',label:'Onboarding'}, attendance:{ic:'🗓',label:'Attendance'},
   leave:{ic:'🏖',label:'Leave'}, compliance:{ic:'⚖',label:'Compliance'},
   approvals:{ic:'✔',label:'EOD Approvals'}, discrepancies:{ic:'⚠',label:'Discrepancies'},
   capa:{ic:'🛠',label:'CAPA / 8D'},
@@ -121,7 +121,7 @@ function renderLogin(errMsg) {
     <h1>JMC Operations Tracker</h1>
     <div class="sub">${esc(State.cfg.company.provider)}</div>
     ${errMsg ? `<div class="err">${esc(errMsg)}</div>` : ''}
-    <div class="field"><label>Username</label><input name="username" autocomplete="username" autofocus required></div>
+    <div class="field"><label>Username or email</label><input name="username" autocomplete="username" autofocus required></div>
     <div class="field"><label>Password</label><input name="password" type="password" autocomplete="current-password" required></div>
     <button class="btn primary" style="width:100%" type="submit">Sign in</button>
     <a id="forgotLink" style="display:block;text-align:center;margin-top:10px;color:#9fc3df;cursor:pointer;font-size:13px">Forgot password?</a>
@@ -1405,7 +1405,7 @@ ROUTES.workers = async function () {
   if (deep) showForm(deep); else showList();
 
   async function showList() {
-    v.innerHTML = topbar('Workers — HR Master', 'Manpower profiles, salary structure and documents.') +
+    v.innerHTML = topbar('Blue Collars — HR Master', 'Manpower profiles, salary structure and documents.') +
       `<div class="card"><div class="btn-row">
         <input id="wq" placeholder="Search name / roll / mobile" style="max-width:240px">
         <select id="wdept" style="width:auto"><option value="">All departments</option>${DEPARTMENTS().map(d=>`<option>${esc(d)}</option>`).join('')}</select>
@@ -1448,7 +1448,7 @@ ROUTES.workers = async function () {
         <div>${id&&!ro?`<input type="file" accept="image/*" id="wphotoInput"><div class="small muted">passport-size photo</div>`:''}${!id?'<div class="small muted">Save the worker first, then add photo & documents.</div>':''}</div>
       </div></div>
       <div class="card"><h3>Personal</h3><div class="grid g3">
-        ${F('Roll No (SL)','f_roll_no',w.roll_no,dis)}${F('Full name *','f_name',w.name,dis)}${F("Father's name",'f_father_name',w.father_name,dis)}
+        ${F('Employee Code','f_roll_no',w.roll_no,dis)}${F('Full name *','f_name',w.name,dis)}${F("Father's name",'f_father_name',w.father_name,dis)}
         ${S('Gender','f_gender',['','Male','Female','Other'],w.gender,dis)}${F('Date of birth','f_dob',w.dob,dis,'date')}${F('Blood group','f_blood_group',w.blood_group,dis)}
         ${F('Mobile','f_mobile',w.mobile,dis)}${F('Aadhaar','f_aadhaar',w.aadhaar,dis)}${F('PAN','f_pan',w.pan,dis)}
       </div><div class="field"><label>Address</label><input id="f_address" value="${esc(w.address||'')}" ${dis}></div></div>

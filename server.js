@@ -150,7 +150,9 @@ app.post('/api/login', async (req, res) => {
   if (!loginThrottle(ip))
     return res.status(429).json({ error: 'Too many login attempts — try again later' });
   const { username, password } = req.body || {};
-  const u = await db.prepare('SELECT * FROM users WHERE username = ? AND active = true').get((username || '').trim());
+  // Accept either a username or an email address as the login identifier.
+  const ident = (username || '').trim();
+  const u = await db.prepare('SELECT * FROM users WHERE active = true AND (username = ? OR lower(email) = lower(?))').get(ident, ident);
   // Always run a bcrypt comparison (real or dummy) for constant-ish timing.
   const ok = bcrypt.compareSync(password || '', u ? u.password_hash : DUMMY_HASH);
   if (!u || !ok)
