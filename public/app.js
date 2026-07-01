@@ -10,6 +10,15 @@ const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&a
 const todayStr = () => new Date().toLocaleDateString('en-CA'); // YYYY-MM-DD local
 const monthStr = (d = new Date()) => d.toISOString().slice(0, 7);
 const fmt = (n) => (n == null ? '0' : Number(n).toLocaleString('en-IN'));
+// Make a non-<button> control keyboard-operable (focusable + Enter/Space activate).
+function activatable(el, fn) {
+  if (!el) return el;
+  el.setAttribute('role', 'button');
+  if (!el.hasAttribute('tabindex')) el.setAttribute('tabindex', '0');
+  el.addEventListener('click', fn);
+  el.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); fn(e); } });
+  return el;
+}
 
 async function api(path, opts = {}) {
   const res = await fetch('/api' + path, {
@@ -45,6 +54,9 @@ const NAV_META = {
   settings:{ic:'⚙',label:'Settings'}, users:{ic:'◐',label:'Users'},
   audit:{ic:'🗒',label:'Audit Log'},
 };
+// Mobile bottom-tab primaries (first 4 present in a role's nav) + short labels.
+const TAB_PRIORITY = ['dashboard','entry','approvals','attendance','discrepancies','workers','requests','reports','mis','billing'];
+const TAB_LABEL = { dashboard:'Home', entry:'Entry', approvals:'Approve', attendance:'Attend', discrepancies:'Issues', workers:'Staff', requests:'Requests', reports:'Reports', mis:'MIS', billing:'Billing' };
 const DEPARTMENTS = () => (State.cfg.approvedManpower||[]).map(c=>c.category).concat('OTHER');
 const inr = (n) => '₹' + fmt(Math.round(+n || 0));
 const DISC_TYPES = {
@@ -144,30 +156,86 @@ function renderLogin(errMsg) {
 }
 
 // ---- shell ----------------------------------------------------------------
+// Off-canvas drawer (mobile): lock background scroll, make the content behind
+// inert to AT + keyboard, move focus in, and restore it to the burger on close.
+function openDrawer(shell) {
+  shell.classList.add('drawer-open');
+  document.body.classList.add('drawer-lock');
+  const side = shell.querySelector('#side'), burger = shell.querySelector('#burger'), view = shell.querySelector('#view');
+  if (side) { side.setAttribute('role', 'dialog'); side.setAttribute('aria-modal', 'true'); }
+  if (burger) burger.setAttribute('aria-expanded', 'true');
+  if (view) view.setAttribute('inert', '');
+  const first = shell.querySelector('#nav [data-route]'); if (first) first.focus();
+}
+function closeDrawer(shell, returnFocus) {
+  shell.classList.remove('drawer-open');
+  document.body.classList.remove('drawer-lock');
+  const side = shell.querySelector('#side'), burger = shell.querySelector('#burger'), view = shell.querySelector('#view');
+  if (side) { side.removeAttribute('role'); side.removeAttribute('aria-modal'); }
+  if (view) view.removeAttribute('inert');
+  if (burger) { burger.setAttribute('aria-expanded', 'false'); if (returnFocus) burger.focus(); }
+}
+
 function renderApp() {
   const nav = ROLE_NAV[State.user.role] || ['dashboard'];
   if (!nav.includes(State.route)) State.route = 'dashboard';
   $('#root').innerHTML = '';
+  document.body.classList.remove('drawer-lock');   // clear any lock left by an open drawer
+  const curLabel = (NAV_META[State.route] || {}).label || 'JMC Ops';
   const shell = h(`<div class="app">
-    <aside class="side">
+    <div class="scrim" id="scrim"></div>
+    <header class="appbar">
+      <button class="burger" id="burger" aria-label="Menu" aria-controls="side" aria-expanded="false">☰</button>
+      <img class="ab-logo" src="/logo.svg" alt="">
+      <div class="ab-title" title="${esc(curLabel)}">${esc(curLabel)}</div>
+    </header>
+    <aside class="side" id="side">
       <div class="brand"><img class="brandlogo" src="/logo.svg" alt="Drona Valuechain"><div class="bt"><b>Drona Valuechain</b><span>JMC Operations Tracker</span></div></div>
-      <nav id="nav"></nav>
+      <nav id="nav" aria-label="Primary"></nav>
       <div class="who"><b>${esc(State.user.name)}</b>${esc(State.user.roleLabel)} · ${esc(State.user.company)}
         <div style="margin-top:8px"><a id="chgpw" style="color:#9fc3df;cursor:pointer">Change password</a>
           <a id="logout" style="color:#9fc3df;cursor:pointer;margin-left:12px">Sign out →</a></div></div>
     </aside>
     <main class="main" id="view"></main>
+    <nav class="tabbar" id="tabbar"></nav>
   </div>`);
   $('#root').appendChild(shell);
   const navEl = $('#nav');
   nav.forEach(r => {
     const m = NAV_META[r];
     const a = h(`<a data-route="${r}" class="${r===State.route?'active':''}"><span class="ic">${m.ic}</span>${m.label}<span class="badge hidden" data-badge="${r}"></span></a>`);
-    a.addEventListener('click', () => { State.route = r; renderApp(); });
+    activatable(a, () => { State.route = r; renderApp(); });
     navEl.appendChild(a);
   });
-  $('#logout').addEventListener('click', async () => { await api('/logout', { method: 'POST' }); location.reload(); });
-  $('#chgpw').addEventListener('click', passwordModal);
+
+  // Bottom tab bar (mobile): up to 4 role-relevant primaries + a "More" drawer toggle.
+  const tabEl = $('#tabbar');
+  const tabItems = TAB_PRIORITY.filter(r => nav.includes(r)).slice(0, 4);
+  tabItems.forEach(r => {
+    const m = NAV_META[r];
+    const a = h(`<a data-route="${r}" class="${r===State.route?'active':''}"><span class="ic">${m.ic}</span><span>${esc(TAB_LABEL[r] || m.label)}</span><span class="badge hidden" data-badge="${r}"></span></a>`);
+    activatable(a, () => { State.route = r; renderApp(); });
+    tabEl.appendChild(a);
+  });
+  const more = h(`<a class="${tabItems.includes(State.route) ? '' : 'active'}" aria-label="More menu"><span class="ic">☰</span><span>More</span></a>`);
+  activatable(more, () => openDrawer(shell));
+  tabEl.appendChild(more);
+
+  // Drawer open/close (mobile) — scroll-lock, inert background, focus return.
+  $('#burger').addEventListener('click', () => shell.classList.contains('drawer-open') ? closeDrawer(shell, true) : openDrawer(shell));
+  $('#scrim').addEventListener('click', () => closeDrawer(shell, true));
+  $('#side').addEventListener('keydown', (e) => {              // trap Tab only while the mobile drawer is open
+    if (e.key !== 'Tab' || !shell.classList.contains('drawer-open')) return;
+    const f = [...shell.querySelectorAll('#side [tabindex="0"], #side button, #side [href]')].filter(el => el.offsetParent !== null);
+    if (!f.length) return;
+    const first = f[0], last = f[f.length - 1];
+    if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+    else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+  });
+
+  activatable($('#logout'), async () => { await api('/logout', { method: 'POST' }); location.reload(); });
+  activatable($('#chgpw'), passwordModal);
+  initTableEnhancer();
   ROUTES[State.route]();
   refreshBadges();
 }
@@ -176,9 +244,9 @@ async function refreshBadges() {
   try {
     const s = await api('/summary?month=' + monthStr());
     const set = (route, n) => {
-      const b = document.querySelector(`[data-badge="${route}"]`);
-      if (!b) return;
-      if (n > 0) { b.textContent = n; b.classList.remove('hidden'); } else b.classList.add('hidden');
+      document.querySelectorAll(`[data-badge="${route}"]`).forEach(b => {
+        if (n > 0) { b.textContent = n; b.classList.remove('hidden'); } else b.classList.add('hidden');
+      });
     };
     if (['JMC_APPROVER','ADMIN'].includes(State.user.role)) set('approvals', s.pending_approvals);
     if (['HQ','ADMIN'].includes(State.user.role)) set('requests', s.pending_mp_requests);
@@ -188,6 +256,51 @@ async function refreshBadges() {
     if (['HQ','ADMIN'].includes(State.user.role)) set('leave', s.pending_leaves);
     set('compliance', s.expiring_docs);
   } catch (_) {}
+}
+
+// Close the mobile drawer on Escape (bound once), restoring focus to the burger.
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') { const a = document.querySelector('.app.drawer-open'); if (a) closeDrawer(a, true); }
+});
+
+// Responsive tables: wrap every rendered table for smooth horizontal scroll, and
+// on phones turn list-style tables into stacked, labelled cards. Matrix/total
+// tables (a colspan cell, or >=9 columns) keep scrolling instead. A MutationObserver
+// on #root catches async-loaded tables too; each table is processed once (idempotent).
+// Only #root tables are enhanced — modals are appended to <body>, so any future modal
+// table must be wrapped/handled explicitly (no modal contains a table today).
+let _enhancing = false, _tblObs = null;
+function enhanceTables() {
+  if (_enhancing) return;           // defensive re-entrancy guard; real idempotency is the data-enh flag
+  _enhancing = true;
+  try {
+  document.querySelectorAll('#root table:not([data-enh])').forEach(tbl => {
+    tbl.setAttribute('data-enh', '1');
+    if (tbl.classList.contains('qctab')) return;            // editable QC grid — already scroll-wrapped
+    const ths = [...tbl.querySelectorAll('thead th')].map(t => t.textContent.trim());
+    if (!tbl.parentElement || !tbl.parentElement.classList.contains('tscroll')) {
+      const w = document.createElement('div'); w.className = 'tscroll';
+      tbl.parentNode.insertBefore(w, tbl); w.appendChild(tbl);
+    }
+    if (tbl.querySelector('td[colspan],th[colspan]') || ths.length >= 9) { tbl.classList.add('matrix'); return; }
+    if (!ths.length) return;          // no header labels → leave as a plain (wrapped) table
+    tbl.classList.add('stackt');
+    tbl.querySelectorAll('tbody tr').forEach(tr => {
+      let i = 0;
+      [...tr.children].forEach(td => {
+        if (ths[i] && !td.hasAttribute('data-label')) td.setAttribute('data-label', ths[i]);
+        i += td.colSpan || 1;
+      });
+    });
+  });
+  } finally { _enhancing = false; }
+}
+function initTableEnhancer() {
+  if (_tblObs) { enhanceTables(); return; }
+  const root = document.getElementById('root'); if (!root) return;
+  _tblObs = new MutationObserver(() => enhanceTables());
+  _tblObs.observe(root, { childList: true, subtree: true });
+  enhanceTables();
 }
 
 // ---- shared: image resize + QR scanner ------------------------------------
@@ -272,7 +385,7 @@ async function scanQR(targetInput) {
   try { stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } }); }
   catch (e) { toast('Camera blocked — type the code manually', 'bad'); return; }
   const det = new window.BarcodeDetector({ formats: ['qr_code', 'code_128', 'ean_13', 'code_39'] });
-  const overlay = h(`<div style="position:fixed;inset:0;background:rgba(0,0,0,.85);z-index:60;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px">
+  const overlay = h(`<div style="position:fixed;inset:0;background:rgba(0,0,0,.85);z-index:100;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px">
     <video autoplay playsinline style="max-width:90vw;max-height:70vh;border-radius:12px"></video>
     <div style="color:#fff">Point the camera at the QR / barcode</div>
     <button class="btn ghost" id="qrCancel">Cancel</button></div>`);
@@ -354,7 +467,7 @@ ROUTES.dashboard = async function () {
       ['tint-'+(s.pending_mp_requests>0?'warn':'ok'),'Pending MP Requests', s.pending_mp_requests, 'awaiting HQ'],
       ['tint-'+(s.open_discrepancies>0?'bad':'ok'),'Open Discrepancies', s.open_discrepancies, 'concern areas'],
     ];
-    let html = `<div class="grid g4" style="margin-bottom:16px">` +
+    let html = `<div class="grid g4 kpigrid" style="margin-bottom:16px">` +
       kpis.map(k => `<div class="kpi ${k[0]}"><div class="l">${k[1]}</div><div class="v">${k[2]}</div><div class="sub muted">${k[3]}</div></div>`).join('') +
       `</div>`;
 
@@ -453,7 +566,7 @@ ROUTES.entry = async function () {
 
       <div class="card"><h3>🔎 PTL / Quality Check (PDI) <span class="muted small">(per part · MG ${mgTarget}/day)</span></h3>
         <div class="field" style="max-width:220px"><label>QC Inspectors (manpower)</label><input type="number" min="0" id="qMp" value="${Q.manpower_count||''}" ${locked?'disabled':''}></div>
-        <div style="overflow-x:auto;margin-top:8px"><table class="qctab"><thead><tr>
+        <div class="tscroll" style="margin-top:8px"><table class="qctab"><thead><tr>
           <th style="min-width:120px">Part no.</th><th class="num">Checked</th><th class="num">Rejected</th><th class="num">Rework</th><th>Defect</th><th></th>
         </tr></thead><tbody id="qcRows"></tbody></table></div>
         ${locked?'':`<button class="btn ghost sm" id="qcAdd" style="margin-top:8px">＋ Add part line</button>`}
@@ -672,14 +785,14 @@ ROUTES.approvals = async function () {
     const modal = h(`<div class="card" style="border-left:4px solid var(--brand-2)">
       <div class="sectionhdr"><h3>${esc(e.work_date)} · <span class="pill ${e.status}">${e.status}</span></h3>
         <button class="btn ghost sm" id="closeRev">Close</button></div>
-      <div class="grid g4" style="margin-bottom:12px">
+      <div class="grid g4 kpigrid" style="margin-bottom:12px">
         <div class="kpi tint-brand"><div class="l">Loading parts</div><div class="v">${fmt(e.loading.parts_qty)}</div><div class="sub muted">${fmt(e.loading.truck_count)} trucks · ${fmt(e.loading.manpower_count)} MP</div></div>
         <div class="kpi tint-brand"><div class="l">Unloading</div><div class="v">${fmt(e.unloading.weight_ton)}<small> ton</small></div><div class="sub muted">${fmt(e.unloading.truck_count)} trucks</div></div>
         <div class="kpi tint-${mgShort?'warn':'ok'}"><div class="l">QC parts</div><div class="v">${fmt(e.qc.parts_qty)}</div><div class="sub ${mgShort?'flag':'muted'}">${mgShort?('Below MG by '+e.mg_shortfall):'MG '+fmt(e.mg_target)+' met'}</div></div>
         <div class="kpi tint-brand"><div class="l">Transport</div><div class="v">${e.transport.length}</div><div class="sub muted">trips</div></div>
       </div>
       <div class="grid g2">
-        <div><h4>Manpower</h4><table><thead><tr><th>Cat</th><th class="num">Appr</th><th class="num">Act</th><th></th></tr></thead><tbody>${mpRows||'<tr><td colspan=4 class=muted>—</td></tr>'}</tbody></table></div>
+        <div><h4>Manpower</h4><table><thead><tr><th>Cat</th><th class="num">Appr</th><th class="num">Act</th><th>Status</th></tr></thead><tbody>${mpRows||'<tr><td colspan=4 class=muted>—</td></tr>'}</tbody></table></div>
         <div><h4>Transport trips</h4><table><thead><tr><th>Route</th><th>Vehicle</th><th>Time</th><th>Remarks</th></tr></thead><tbody>${tripRows}</tbody></table></div>
       </div>
       ${e.attachments && e.attachments.length ? `<h4 style="margin-top:12px">Proof photos (${e.attachments.length})</h4>
@@ -774,7 +887,7 @@ ROUTES.requests = async function () {
 ROUTES.reports = async function () {
   const v = $('#view');
   v.innerHTML = topbar('Monthly Report', 'Consolidated quantities and MG tracking.') +
-    `<div class="card"><div class="btn-row">
+    `<div class="card noprint"><div class="btn-row">
        <label class="small" style="margin:0">Month</label><input type="month" id="repMonth" value="${monthStr()}" style="width:auto">
        <button class="btn ghost" id="csvBtn">⬇ Export CSV</button></div></div>
      <div id="repBody"><div class="empty">Loading…</div></div>`;
@@ -786,7 +899,7 @@ ROUTES.reports = async function () {
   async function load() {
     const s = await api('/summary?month=' + ($('#repMonth').value || monthStr())); last = s;
     const t = s.totals;
-    let html = `<div class="grid g4" style="margin-bottom:14px">
+    let html = `<div class="grid g4 kpigrid" style="margin-bottom:14px">
       <div class="kpi tint-brand"><div class="l">Loading parts</div><div class="v">${fmt(t.load_parts)}</div><div class="sub muted">${fmt(t.load_trucks)} trucks</div></div>
       <div class="kpi tint-brand"><div class="l">Unloading ton</div><div class="v">${fmt(t.unload_ton)}</div><div class="sub muted">${fmt(t.unload_trucks)} trucks</div></div>
       <div class="kpi tint-${t.mg_short_days>0?'warn':'ok'}"><div class="l">QC parts</div><div class="v">${fmt(t.qc_parts)}</div><div class="sub muted">${t.mg_short_days} day(s) below MG</div></div>
@@ -1207,7 +1320,7 @@ function svgBars(items, opts = {}) {
   if (opts.target) { const ty = padT + plotH - Math.round((opts.target / max) * plotH);
     target = `<line x1="${padX}" y1="${ty}" x2="${W-padX}" y2="${ty}" stroke="#dc2626" stroke-width="1.2" stroke-dasharray="5 3"/>
       <text x="${W-padX}" y="${ty-3}" font-size="9" text-anchor="end" fill="#dc2626">${esc(opts.targetLabel||('Target '+opts.target))}</text>`; }
-  return `<div style="overflow-x:auto"><svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" style="max-width:100%">${target}${bars}</svg></div>`;
+  return `<div class="tscroll"><svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" class="misbar">${target}${bars}</svg></div>`;
 }
 function chartCard(title, sub, inner) {
   return `<div class="card"><h3>${esc(title)}${sub?` <span class="muted small">${esc(sub)}</span>`:''}</h3>${inner}</div>`;
@@ -1252,7 +1365,7 @@ ROUTES.mis = async function () {
     ];
     let html = `<div class="printonly" style="margin-bottom:10px"><h2 style="margin:0">JMC Operations — MIS Report</h2>
       <div class="muted small">${esc(State.cfg.company.provider)} · Month: ${esc(month)} · Generated ${new Date().toLocaleString('en-IN')}</div></div>`;
-    html += `<div class="grid g4" style="margin-bottom:16px">` +
+    html += `<div class="grid g4 kpigrid" style="margin-bottom:16px">` +
       kpis.map(k => `<div class="kpi ${k[0]}"><div class="l">${k[1]}</div><div class="v">${k[2]}</div><div class="sub muted">${k[3]}</div></div>`).join('') + `</div>`;
 
     // QC vs MG trend
@@ -1282,7 +1395,7 @@ ROUTES.mis = async function () {
         ['tint-'+(qq.fpy>=99?'ok':'warn'),'First-Pass Yield', (qq.fpy!=null?qq.fpy+'%':'—'), 'passed / checked'],
         ['tint-'+(M.ppmTarget && qq.ppm_derived>M.ppmTarget?'warn':'ok'),'PPM (from defects)', qq.ppm_derived!=null?fmt(qq.ppm_derived):'—', `target ${fmt(M.ppmTarget)}`],
       ];
-      html += `<div class="grid g4" style="margin:4px 0 16px">` +
+      html += `<div class="grid g4 kpigrid" style="margin:4px 0 16px">` +
         qkpis.map(k => `<div class="kpi ${k[0]}"><div class="l">${k[1]}</div><div class="v">${k[2]}</div><div class="sub muted">${k[3]}</div></div>`).join('') + `</div>`;
       if (M.defectPareto && M.defectPareto.length) {
         const dItems = M.defectPareto.map(d => ({ label: d.defect_type, value: d.qty, color: '#dc2626' }));
@@ -1355,7 +1468,7 @@ ROUTES.billing = async function () {
   async function load() {
     const b = await api('/billing?month=' + ($('#bMonth').value || monthStr()));
     const r = b.revenue, p = b.pnl, inv = b.invoice, q = b.quantities;
-    let html = `<div class="grid g4" style="margin-bottom:14px">
+    let html = `<div class="grid g4 kpigrid" style="margin-bottom:14px">
       <div class="kpi tint-brand"><div class="l">Total Revenue</div><div class="v">${inr(r.total)}</div><div class="sub muted">service + transport</div></div>
       <div class="kpi tint-brand"><div class="l">Service Revenue</div><div class="v">${inr(r.service)}</div><div class="sub muted">load + unload + QC</div></div>
       <div class="kpi tint-brand"><div class="l">Transport Revenue</div><div class="v">${inr(r.transport)}</div><div class="sub muted">${b.unknown_trips?('⚠ '+b.unknown_trips+' unrated trip(s)'):'all trips rated'}</div></div>
@@ -1718,7 +1831,7 @@ ROUTES.attendance = async function () {
       const code={PRESENT:'P',ABSENT:'A',HALF_DAY:'H',LEAVE:'L',WEEKLY_OFF:'O'}, col={P:'#dcfce7',A:'#fee2e2',H:'#fef3c7',L:'#e0e7ff',O:'#eef2f7'};
       const body = R.workers.map(w => { const cells = Array.from({length:dim},(_,i)=>{ const dd=String(i+1).padStart(2,'0'); const d=w.days[dd]; const c=d?code[d.s]:''; return `<td class="num" style="padding:4px;background:${c?col[c]:''}">${c}</td>`; }).join('');
         return `<tr><td style="white-space:nowrap">${esc(w.name)}<div class="small muted">${esc(w.department||'')}</div></td>${cells}<td class="num"><b>${w.present_days}</b></td><td class="num">${w.absent_days}</td><td class="num">${w.ot_hours}</td></tr>`; }).join('');
-      $('#regTable').innerHTML = `<div class="card" style="overflow-x:auto"><table style="font-size:11.5px"><thead><tr><th>Blue Collar</th>${dayHdr}<th class="num">P</th><th class="num">A</th><th class="num">OT</th></tr></thead><tbody>${body}</tbody></table>
+      $('#regTable').innerHTML = `<div class="card"><table style="font-size:11.5px"><thead><tr><th>Blue Collar</th>${dayHdr}<th class="num">P</th><th class="num">A</th><th class="num">OT</th></tr></thead><tbody>${body}</tbody></table>
         <p class="small muted" style="margin-top:8px">P=Present · A=Absent · H=Half-day · L=Leave · O=Weekly off</p></div>`;
     }
     function csv() {

@@ -23,6 +23,7 @@ const reports = require('./lib/reports');
 const alerts = require('./lib/alerts');
 const pdf = require('./lib/pdf');
 const mailer = require('./lib/mailer');
+const T = require('./lib/emailTemplate');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -199,8 +200,16 @@ app.post('/api/forgot-password', async (req, res) => {
     await db.prepare(`UPDATE users SET reset_otp_hash=?, reset_otp_expires = now() + interval '${OTP_TTL_MIN} minutes' WHERE id=?`)
       .run(bcrypt.hashSync(otp, 10), u.id);
     mailer.sendMail({ to: u.email, subject: '[Drona] Your password reset code',
-      html: `<p>Hi ${u.name},</p><p>Your password reset code is <b style="font-size:22px;letter-spacing:3px">${otp}</b></p>
-        <p>It expires in ${OTP_TTL_MIN} minutes. If you didn't request this, you can ignore this email.</p>` })
+      html: T.layout({ title: 'Password reset code', kicker: 'Account Security', accent: 'teal',
+        subtitle: `Requested for <b>${T.esc(u.name)}</b>`, preheader: 'Your one-time password reset code',
+        body:
+          `<p style="margin:0 0 14px">Hi ${T.esc(u.name)}, use this one-time code to reset your password:</p>` +
+          `<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"><tr><td align="center">
+             <div style="display:inline-block;background:#e2f5fa;border:1px solid #c5e9f1;border-radius:14px;padding:18px 30px">
+               <div style="font:700 38px/1 -apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;letter-spacing:10px;color:#0f7892">${T.esc(otp)}</div>
+             </div></td></tr></table>` +
+          `<p style="margin:16px 0 0;color:#5f6b7e">This code expires in <b>${OTP_TTL_MIN} minutes</b>. If you didn't request a reset, you can safely ignore this email.</p>`,
+        footerNote: 'For your security, never share this code with anyone.' }) })
       .catch(e => console.error('OTP mail failed:', e.message));
     audit(u.id, 'OTP_REQUEST');
   }
@@ -1313,7 +1322,10 @@ app.post('/api/alerts/test', auth, requireRole('ADMIN'), async (req, res) => {
   if (!to) return res.status(400).json({ error: 'No recipients configured' });
   if (!mailer.isConfigured()) return res.status(400).json({ error: 'SMTP is not configured (set SMTP_HOST etc. in .env)' });
   const result = await mailer.sendMail({ to, subject: '[Drona] Test alert email',
-    html: '<p>This is a test alert from the JMC Operations Tracker. If you received this, SMTP is working.</p>' });
+    html: T.layout({ title: 'SMTP test successful', kicker: 'Diagnostics', accent: 'ok',
+      subtitle: 'Your mail configuration is working', preheader: 'SMTP is working',
+      body: T.noticeCard({ tone: 'ok', title: '✓ Delivery confirmed',
+        html: 'If you are reading this, the JMC Operations Tracker can send email through your configured SMTP server.' }) }) });
   audit(req.user.id, 'ALERT_TEST', { to });
   res.json({ ok: true, result });
 });
