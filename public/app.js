@@ -45,6 +45,9 @@ const NAV_META = {
   settings:{ic:'⚙',label:'Settings'}, users:{ic:'◐',label:'Users'},
   audit:{ic:'🗒',label:'Audit Log'},
 };
+// Mobile bottom-tab primaries (first 4 present in a role's nav) + short labels.
+const TAB_PRIORITY = ['dashboard','entry','approvals','attendance','discrepancies','workers','requests','reports','mis','billing'];
+const TAB_LABEL = { dashboard:'Home', entry:'Entry', approvals:'Approve', attendance:'Attend', discrepancies:'Issues', workers:'Staff', requests:'Requests', reports:'Reports', mis:'MIS', billing:'Billing' };
 const DEPARTMENTS = () => (State.cfg.approvedManpower||[]).map(c=>c.category).concat('OTHER');
 const inr = (n) => '₹' + fmt(Math.round(+n || 0));
 const DISC_TYPES = {
@@ -148,8 +151,15 @@ function renderApp() {
   const nav = ROLE_NAV[State.user.role] || ['dashboard'];
   if (!nav.includes(State.route)) State.route = 'dashboard';
   $('#root').innerHTML = '';
+  const curLabel = (NAV_META[State.route] || {}).label || 'JMC Ops';
   const shell = h(`<div class="app">
-    <aside class="side">
+    <div class="scrim" id="scrim"></div>
+    <header class="appbar">
+      <button class="burger" id="burger" aria-label="Open menu">☰</button>
+      <img class="ab-logo" src="/logo.svg" alt="">
+      <div class="ab-title">${esc(curLabel)}</div>
+    </header>
+    <aside class="side" id="side">
       <div class="brand"><img class="brandlogo" src="/logo.svg" alt="Drona Valuechain"><div class="bt"><b>Drona Valuechain</b><span>JMC Operations Tracker</span></div></div>
       <nav id="nav"></nav>
       <div class="who"><b>${esc(State.user.name)}</b>${esc(State.user.roleLabel)} · ${esc(State.user.company)}
@@ -157,6 +167,7 @@ function renderApp() {
           <a id="logout" style="color:#9fc3df;cursor:pointer;margin-left:12px">Sign out →</a></div></div>
     </aside>
     <main class="main" id="view"></main>
+    <nav class="tabbar" id="tabbar"></nav>
   </div>`);
   $('#root').appendChild(shell);
   const navEl = $('#nav');
@@ -166,8 +177,27 @@ function renderApp() {
     a.addEventListener('click', () => { State.route = r; renderApp(); });
     navEl.appendChild(a);
   });
+
+  // Bottom tab bar (mobile): up to 4 role-relevant primaries + a "More" drawer toggle.
+  const tabEl = $('#tabbar');
+  const tabItems = TAB_PRIORITY.filter(r => nav.includes(r)).slice(0, 4);
+  tabItems.forEach(r => {
+    const m = NAV_META[r];
+    const a = h(`<a data-route="${r}" class="${r===State.route?'active':''}"><span class="ic">${m.ic}</span><span>${esc(TAB_LABEL[r] || m.label)}</span><span class="badge hidden" data-badge="${r}"></span></a>`);
+    a.addEventListener('click', () => { State.route = r; renderApp(); });
+    tabEl.appendChild(a);
+  });
+  const more = h(`<a class="${tabItems.includes(State.route) ? '' : 'active'}" aria-label="More menu"><span class="ic">☰</span><span>More</span></a>`);
+  more.addEventListener('click', () => shell.classList.add('drawer-open'));
+  tabEl.appendChild(more);
+
+  // Drawer open/close (mobile)
+  $('#burger').addEventListener('click', () => shell.classList.toggle('drawer-open'));
+  $('#scrim').addEventListener('click', () => shell.classList.remove('drawer-open'));
+
   $('#logout').addEventListener('click', async () => { await api('/logout', { method: 'POST' }); location.reload(); });
   $('#chgpw').addEventListener('click', passwordModal);
+  initTableEnhancer();
   ROUTES[State.route]();
   refreshBadges();
 }
@@ -176,9 +206,9 @@ async function refreshBadges() {
   try {
     const s = await api('/summary?month=' + monthStr());
     const set = (route, n) => {
-      const b = document.querySelector(`[data-badge="${route}"]`);
-      if (!b) return;
-      if (n > 0) { b.textContent = n; b.classList.remove('hidden'); } else b.classList.add('hidden');
+      document.querySelectorAll(`[data-badge="${route}"]`).forEach(b => {
+        if (n > 0) { b.textContent = n; b.classList.remove('hidden'); } else b.classList.add('hidden');
+      });
     };
     if (['JMC_APPROVER','ADMIN'].includes(State.user.role)) set('approvals', s.pending_approvals);
     if (['HQ','ADMIN'].includes(State.user.role)) set('requests', s.pending_mp_requests);
@@ -188,6 +218,49 @@ async function refreshBadges() {
     if (['HQ','ADMIN'].includes(State.user.role)) set('leave', s.pending_leaves);
     set('compliance', s.expiring_docs);
   } catch (_) {}
+}
+
+// Close the mobile drawer on Escape (bound once).
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') { const a = document.querySelector('.app.drawer-open'); if (a) a.classList.remove('drawer-open'); }
+});
+
+// Responsive tables: wrap every rendered table for smooth horizontal scroll, and
+// on phones turn list-style tables into stacked, labelled cards. Matrix/total
+// tables (a colspan cell, or >=9 columns) keep scrolling instead. A MutationObserver
+// catches async-loaded tables too; each table is processed once (idempotent).
+let _enhancing = false, _tblObs = null;
+function enhanceTables() {
+  if (_enhancing) return;           // ignore mutations we cause by wrapping tables
+  _enhancing = true;
+  try {
+  document.querySelectorAll('#root table:not([data-enh])').forEach(tbl => {
+    tbl.setAttribute('data-enh', '1');
+    if (tbl.classList.contains('qctab')) return;            // editable QC grid — already scroll-wrapped
+    const ths = [...tbl.querySelectorAll('thead th')].map(t => t.textContent.trim());
+    if (!tbl.parentElement || !tbl.parentElement.classList.contains('tscroll')) {
+      const w = document.createElement('div'); w.className = 'tscroll';
+      tbl.parentNode.insertBefore(w, tbl); w.appendChild(tbl);
+    }
+    if (tbl.querySelector('td[colspan],th[colspan]') || ths.length >= 9) { tbl.classList.add('matrix'); return; }
+    if (!ths.length) return;          // no header labels → leave as a plain (wrapped) table
+    tbl.classList.add('stackt');
+    tbl.querySelectorAll('tbody tr').forEach(tr => {
+      let i = 0;
+      [...tr.children].forEach(td => {
+        if (ths[i] && !td.hasAttribute('data-label')) td.setAttribute('data-label', ths[i]);
+        i += td.colSpan || 1;
+      });
+    });
+  });
+  } finally { _enhancing = false; }
+}
+function initTableEnhancer() {
+  if (_tblObs) { enhanceTables(); return; }
+  const root = document.getElementById('root'); if (!root) return;
+  _tblObs = new MutationObserver(() => enhanceTables());
+  _tblObs.observe(root, { childList: true, subtree: true });
+  enhanceTables();
 }
 
 // ---- shared: image resize + QR scanner ------------------------------------
