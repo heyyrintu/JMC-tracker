@@ -24,6 +24,8 @@ const alerts = require('./lib/alerts');
 const pdf = require('./lib/pdf');
 const mailer = require('./lib/mailer');
 const T = require('./lib/emailTemplate');
+const cors = require('cors'); // cross-origin access for the Capacitor Android WebView
+const { extractToken } = require('./lib/authToken'); // Bearer/query/cookie token resolver
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -33,6 +35,17 @@ const SESSION_HOURS = 12;
 // Trust the first proxy hop (nginx/caddy in the documented deploy) so req.ip
 // reflects the real client for rate limiting, and Secure cookies work over TLS.
 app.set('trust proxy', 1);
+
+// Cross-origin access for the bundled Capacitor WebView. Auth is token-based
+// (Authorization: Bearer), so cross-site cookies/credentials are NOT needed —
+// just an explicit origin allowlist plus the headers the app sends.
+const APP_ORIGINS = new Set(['https://localhost', 'http://localhost', 'capacitor://localhost']);
+app.use(cors({
+  origin(origin, cb) { cb(null, !origin || APP_ORIGINS.has(origin)); },
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Client-Platform'],
+  maxAge: 86400,
+}));
 
 // Folder for uploaded proof photos.
 const UPLOAD_DIR = process.env.UPLOAD_DIR || path.join(__dirname, 'uploads');
@@ -96,19 +109,32 @@ function publicUser(u) {
            email: u.email || null, roleLabel: config.ROLES[u.role] || u.role };
 }
 async function currentUser(req) {
-  const token = req.cookies.sid;
+  const token = extractToken(req); // Authorization: Bearer -> ?access_token (GET) -> sid cookie
   if (!token) return null;
-  // Sessions expire server-side after SESSION_HOURS — a stolen token can't live
-  // forever, and the client-side cookie maxAge alone is not trustworthy.
-  const row = await db.prepare(`SELECT u.* FROM sessions s JOIN users u ON u.id = s.user_id
+  // Validate on expires_at when present (web = 12h, mobile = 30d). Rows created
+  // before the mobile-session migration have NULL expires_at, so fall back to
+  // the original SESSION_HOURS rule to keep existing web sessions valid.
+  const row = await db.prepare(`SELECT u.*, s.kind AS session_kind FROM sessions s JOIN users u ON u.id = s.user_id
                           WHERE s.token = ? AND u.active = true
-                            AND s.created_at > now() - interval '${SESSION_HOURS} hours'`)
+                            AND ( (s.expires_at IS NOT NULL AND s.expires_at > now())
+                               OR (s.expires_at IS NULL AND s.created_at > now() - interval '${SESSION_HOURS} hours') )`)
     .get(token);
-  return row || null;
+  if (!row) return null;
+  // Sliding refresh for mobile sessions: keep a 30-day window, but only write
+  // when it has drifted under 29 days so we don't UPDATE on every request.
+  if (row.session_kind === 'mobile') {
+    try {
+      await db.prepare(`UPDATE sessions SET expires_at = now() + interval '1 hour' * 720
+                          WHERE token = ? AND (expires_at IS NULL OR expires_at < now() + interval '1 day' * 29)`).run(token);
+    } catch (_) {}
+  }
+  return row;
 }
 async function pruneSessions() {
   try {
-    await db.prepare(`DELETE FROM sessions WHERE created_at <= now() - interval '${SESSION_HOURS} hours'`).run();
+    await db.prepare(`DELETE FROM sessions
+       WHERE (expires_at IS NOT NULL AND expires_at <= now())
+          OR (expires_at IS NULL AND created_at <= now() - interval '${SESSION_HOURS} hours')`).run();
   } catch (_) {}
 }
 async function auth(req, res, next) {
@@ -161,10 +187,16 @@ app.post('/api/login', async (req, res) => {
   loginReset(ip);
   pruneSessions();
   const token = crypto.randomBytes(24).toString('hex');
-  await db.prepare('INSERT INTO sessions (token, user_id) VALUES (?, ?)').run(token, u.id);
+  const isMobile = String(req.get('X-Client-Platform') || '').toLowerCase() === 'android';
+  const ttlHours = isMobile ? 24 * 30 : SESSION_HOURS; // 30d mobile, 12h web
+  await db.prepare(`INSERT INTO sessions (token, user_id, kind, expires_at)
+                    VALUES (?, ?, ?, now() + interval '1 hour' * ?)`)
+    .run(token, u.id, isMobile ? 'mobile' : 'web', ttlHours);
   res.cookie('sid', token, SESSION_COOKIE);
   audit(u.id, 'LOGIN');
-  res.json({ user: publicUser(u) });
+  // token returned in the body for the native app (Bearer auth); the web app
+  // ignores it and keeps using the httpOnly cookie.
+  res.json({ user: publicUser(u), token });
 });
 
 app.post('/api/logout', auth, async (req, res) => {
