@@ -33,15 +33,18 @@ model User {
   resetOtpHash    String?   @map("reset_otp_hash")
   resetOtpExpires DateTime? @map("reset_otp_expires")
 
-  sessions Session[]
+  sessions     Session[]
+  deviceTokens DeviceToken[]
 
   @@map("users")
 }
 
 model Session {
-  token     String   @id
-  userId    Int      @map("user_id")
-  createdAt DateTime @default(now()) @map("created_at")
+  token     String    @id
+  userId    Int       @map("user_id")
+  createdAt DateTime  @default(now()) @map("created_at")
+  expiresAt DateTime? @map("expires_at")
+  kind      String    @default("web") // web (12h) | mobile (30d sliding)
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
@@ -386,4 +389,23 @@ model Capa {
 
   @@index([status], map: "idx_capa_status")
   @@map("capa")
+}
+
+// FCM device push tokens — one row per (user, device). WS5 (push server)
+// registers/removes tokens and fans out notifications to them.
+model DeviceToken {
+  id         Int       @id @default(autoincrement())
+  userId     Int       @map("user_id")
+  token      String    @unique
+  platform   String?
+  deviceInfo String?   @map("device_info")
+  active     Boolean   @default(true)
+  lastSeenAt DateTime? @map("last_seen_at")
+  createdAt  DateTime  @default(now()) @map("created_at")
+  updatedAt  DateTime  @default(now()) @map("updated_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId], map: "idx_device_tokens_user")
+  @@map("device_tokens")
 }
