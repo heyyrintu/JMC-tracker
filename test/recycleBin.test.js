@@ -80,6 +80,31 @@ test('EDIT_BEFORE plan overwrites in place and keeps the original id', () => {
   assert.strictEqual(plan.conflict, null, 'overwriting its own row cannot self-conflict');
 });
 
+// Regression: Postgres rejects text -> timestamp with SQLSTATE 42804, so an
+// ISO datetime that survived JSON.stringify must go back in as a Date.
+test('ISO datetime strings are revived to Date objects for re-insert', () => {
+  const parent = { id: 7, work_date: '2026-07-14', created_at: '2026-07-14T09:30:00.000Z' };
+  const kids = { qc_lines: [{ id: 1, entry_id: 7, created_at: '2026-07-14T10:00:00.000Z' }] };
+  const plan = rb.buildRestorePlan({
+    entity: 'daily_entry', kind: 'DELETE',
+    payload: rb.buildPayload({ entity: 'daily_entry', parent, children: kids }),
+  });
+  assert.ok(plan.parent.created_at instanceof Date, 'parent timestamp must be a Date');
+  assert.strictEqual(plan.parent.created_at.toISOString(), '2026-07-14T09:30:00.000Z');
+  const line = plan.children.find((c) => c.table === 'qc_lines').rows[0];
+  assert.ok(line.created_at instanceof Date, 'child timestamp must be a Date');
+});
+
+test('plain YYYY-MM-DD values stay text — those columns are not timestamps', () => {
+  const parent = { id: 7, work_date: '2026-07-14' };
+  const plan = rb.buildRestorePlan({
+    entity: 'daily_entry', kind: 'DELETE',
+    payload: rb.buildPayload({ entity: 'daily_entry', parent, children: {} }),
+  });
+  assert.strictEqual(plan.parent.work_date, '2026-07-14');
+  assert.strictEqual(typeof plan.parent.work_date, 'string');
+});
+
 test('entities without children produce an empty children list', () => {
   const plan = rb.buildRestorePlan({
     entity: 'capa',
