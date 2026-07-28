@@ -9,6 +9,66 @@ const h = (html) => { const t = document.createElement('template'); t.innerHTML 
 const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const todayStr = () => new Date().toLocaleDateString('en-CA'); // YYYY-MM-DD local
 const monthStr = (d = new Date()) => d.toISOString().slice(0, 7);
+// Last calendar day of a 'YYYY-MM' month, as 'YYYY-MM-DD'.
+const monthEnd = (m) => {
+  const [y, mo] = m.split('-').map(Number);
+  return `${m}-${String(new Date(Date.UTC(y, mo, 0)).getUTCDate()).padStart(2, '0')}`;
+};
+
+// Month <-> date-range picker shared by the dated report screens. Renders a mode
+// toggle plus the matching inputs and hands back the query string the API wants
+// — `month=YYYY-MM` in Month mode, `from=…&to=…` in Range mode. Each instance
+// gets its own id prefix so several can coexist. Usage:
+//   const pp = periodPicker(load);
+//   v.innerHTML = `<div class="btn-row">${pp.html}</div>…`; pp.wire(); load();
+//   … await api('/summary?' + pp.query())
+let _ppSeq = 0;
+function periodPicker(onChange) {
+  const uid = 'pp' + (++_ppSeq);
+  const m0 = monthStr();
+  const el = (s) => $('#' + uid + s);
+  return {
+    html: `<label class="small" style="margin:0">Period</label>
+      <select id="${uid}Mode" style="width:auto"><option value="month">Month</option><option value="range">Date range</option></select>
+      <input type="month" id="${uid}M" value="${m0}" style="width:auto">
+      <span id="${uid}R" class="inline" style="display:none;gap:6px">
+        <input type="date" id="${uid}F" value="${m0}-01" style="width:auto">
+        <span class="small muted">to</span>
+        <input type="date" id="${uid}T" value="${monthEnd(m0)}" style="width:auto"></span>`,
+    wire() {
+      const sync = () => {
+        const range = el('Mode').value === 'range';
+        el('M').style.display = range ? 'none' : '';
+        el('R').style.display = range ? 'inline-flex' : 'none';
+      };
+      // Keep the range bounds tracking the month box, so switching modes starts
+      // from the period already on screen rather than a stale default.
+      el('M').addEventListener('change', () => {
+        const v = el('M').value || monthStr();
+        el('F').value = v + '-01';
+        el('T').value = monthEnd(v);
+      });
+      el('Mode').addEventListener('change', () => { sync(); onChange(); });
+      ['M', 'F', 'T'].forEach(k => el(k).addEventListener('change', onChange));
+      sync();
+    },
+    query() {
+      if (el('Mode').value === 'range') {
+        const f = el('F').value, t = el('T').value;
+        if (f && t) return `from=${f}&to=${t}`;
+      }
+      return 'month=' + (el('M').value || monthStr());
+    },
+    // Human-readable period, for headings and export filenames.
+    label() {
+      if (el('Mode').value === 'range') {
+        const f = el('F').value, t = el('T').value;
+        if (f && t) return `${f} to ${t}`;
+      }
+      return el('M').value || monthStr();
+    },
+  };
+}
 const fmt = (n) => (n == null ? '0' : Number(n).toLocaleString('en-IN'));
 // Make a non-<button> control keyboard-operable (focusable + Enter/Space activate).
 function activatable(el, fn) {
@@ -41,7 +101,7 @@ const ROLE_NAV = {
   OPERATOR:     ['dashboard','entry','workers','onboarding','attendance','leave','compliance','discrepancies','capa','requests','reports','mis'],
   JMC_APPROVER: ['dashboard','approvals','discrepancies','capa','reports','mis'],
   HQ:           ['dashboard','workers','onboarding','attendance','leave','compliance','discrepancies','capa','requests','reports','mis','billing'],
-  ADMIN:        ['dashboard','entry','workers','onboarding','attendance','leave','compliance','approvals','discrepancies','capa','requests','reports','mis','billing','settings','users','audit'],
+  ADMIN:        ['dashboard','entry','workers','onboarding','attendance','leave','compliance','approvals','discrepancies','capa','requests','reports','mis','billing','settings','users','audit','archive'],
 };
 const NAV_META = {
   dashboard:{ic:'▤',label:'Dashboard'}, entry:{ic:'✎',label:'Daily Entry'},
@@ -53,6 +113,7 @@ const NAV_META = {
   reports:{ic:'▦',label:'Reports'}, mis:{ic:'▣',label:'MIS Dashboard'}, billing:{ic:'₹',label:'Billing'},
   settings:{ic:'⚙',label:'Settings'}, users:{ic:'◐',label:'Users'},
   audit:{ic:'🗒',label:'Audit Log'},
+  archive:{ic:'🗃',label:'Data Admin'},
 };
 // Mobile bottom-tab primaries (first 4 present in a role's nav) + short labels.
 const TAB_PRIORITY = ['dashboard','entry','approvals','attendance','discrepancies','workers','requests','reports','mis','billing'];
@@ -441,24 +502,18 @@ function passwordModal() {
 const ROUTES = {};
 ROUTES.dashboard = async function () {
   const v = $('#view');
+  const pp = periodPicker(loadDash);
   v.innerHTML = topbar('Operations Dashboard', `${State.cfg.company.provider} → ${State.cfg.company.client}`) +
     `<div class="btn-row" style="margin-bottom:14px">
-       <label class="small" style="margin:0">Month</label>
-       <input type="month" id="dashMonth" value="${monthStr()}" style="width:auto">
+       ${pp.html}
      </div><div id="dashBody"><div class="empty">Loading…</div></div>`;
-  $('#dashMonth').addEventListener('change', loadDash);
+  pp.wire();
   loadDash();
 
   async function loadDash() {
-    const month = $('#dashMonth').value || monthStr();
-    const s = await api('/summary?month=' + month);
+    const s = await api('/summary?' + pp.query());
     const t = s.totals;
-    const approvedMp = State.cfg.approvedManpower.reduce((a, x) => a + x.approved, 0);
-    const lastMpDay = s.days.slice().reverse().find(d => d.mp_actual > 0);
-    const todayMp = lastMpDay ? lastMpDay.mp_actual : 0;
     const kpis = [
-      ['tint-brand','Approved Manpower (MG)', approvedMp, 'baseline / day'],
-      ['tint-'+(todayMp>=approvedMp?'ok':'warn'),'Latest Actual Manpower', todayMp, todayMp>=approvedMp?'meets baseline':'below baseline'],
       ['tint-brand','Loading Parts', fmt(t.load_parts), `${fmt(t.load_trucks)} trucks`],
       ['tint-brand','Unloading', fmt(t.unload_ton)+' <small>ton</small>', `${fmt(t.unload_trucks)} trucks`],
       ['tint-'+(t.mg_short_days>0?'warn':'ok'),'QC / PDI Parts', fmt(t.qc_parts), `MG ${fmt(s.mg_target)}/day · ${t.mg_short_days} day(s) below`],
@@ -471,33 +526,18 @@ ROUTES.dashboard = async function () {
       kpis.map(k => `<div class="kpi ${k[0]}"><div class="l">${k[1]}</div><div class="v">${k[2]}</div><div class="sub muted">${k[3]}</div></div>`).join('') +
       `</div>`;
 
-    // Manpower baseline vs actual
-    const mpCat = State.cfg.approvedManpower;
-    html += `<div class="card"><h3>Manpower — Approved (MG) vs Latest Actual</h3><table><thead><tr>
-      <th>Category</th><th class="num">Approved (MG)</th><th class="num">Latest Actual</th><th>Status</th></tr></thead><tbody>`;
-    const lastEntry = lastMpDay ? await api('/entries/' + lastMpDay.id).then(r => r.entry) : null;
-    const actualMap = {};
-    if (lastEntry) lastEntry.manpower.forEach(m => actualMap[m.category] = m.actual_count);
-    mpCat.forEach(c => {
-      const act = actualMap[c.category] ?? 0;
-      const ok = act >= c.approved;
-      html += `<tr><td>${esc(c.label)}</td><td class="num">${c.approved}</td><td class="num">${act}</td>
-        <td><span class="pill ${ok?'ok':'bad'}">${ok?'OK':'Short '+(c.approved-act)}</span></td></tr>`;
-    });
-    html += `</tbody></table>${lastEntry?`<p class="small muted" style="margin-top:8px">Latest entry: ${esc(lastEntry.work_date)} (${esc(lastEntry.status)})</p>`:''}</div>`;
-
     // Recent days
-    html += `<div class="card"><h3>Daily Activity — ${esc(month)}</h3>`;
+    html += `<div class="card"><h3>Daily Activity — ${esc(pp.label())}</h3>`;
     if (!s.days.length) html += `<div class="empty">No entries recorded for this month yet.</div>`;
     else {
       html += `<table><thead><tr><th>Date</th><th>Status</th><th class="num">Load (parts)</th>
-        <th class="num">Unload (ton)</th><th class="num">QC (parts)</th><th class="num">Trips</th><th class="num">MP</th></tr></thead><tbody>`;
+        <th class="num">Unload (ton)</th><th class="num">QC (parts)</th><th class="num">Trips</th></tr></thead><tbody>`;
       s.days.slice().reverse().forEach(d => {
         const mgShort = d.qc_parts > 0 && d.qc_parts < s.mg_target;
         html += `<tr><td>${esc(d.work_date)}</td><td><span class="pill ${d.status}">${d.status}</span></td>
           <td class="num">${fmt(d.load_parts)}</td><td class="num">${fmt(d.unload_ton)}</td>
           <td class="num ${mgShort?'flag':''}">${fmt(d.qc_parts)}${mgShort?' ⚠':''}</td>
-          <td class="num">${fmt(d.trips)}</td><td class="num">${fmt(d.mp_actual)}</td></tr>`;
+          <td class="num">${fmt(d.trips)}</td></tr>`;
       });
       html += `</tbody></table>`;
     }
@@ -509,6 +549,90 @@ ROUTES.dashboard = async function () {
 // ===========================================================================
 // DAILY ENTRY  (Operator / Admin)
 // ===========================================================================
+
+// Bulk-import the JMC MIS workbook. Uploads twice on purpose: once to preview
+// what would change (commit:false), then to write it (commit:true), so the user
+// sees how many days are new / updated / locked before anything is saved.
+function uploadExcelModal(onDone) {
+  const ov = h(`<div class="modal-backdrop"><div class="modal">
+    <h3>⬆ Upload Excel data</h3>
+    <p class="small muted">Reads the <b>PDI</b>, <b>Loading</b> and <b>Un-Loading</b> sheets of the JMC MIS
+      workbook (.xlsx). Every date becomes a draft day you can review and submit as usual.
+      Days already submitted or approved are left untouched.</p>
+    <div class="field"><label>Workbook (.xlsx)</label><input type="file" accept=".xlsx" id="xlFile"></div>
+    <div id="xlResult"></div>
+    <div class="btn-row" style="margin-top:4px">
+      <button class="btn ghost sm" id="xlTemplate">⬇ Download sample sheet</button>
+      <span style="flex:1"></span>
+      <button class="btn ghost" id="xlCancel">Cancel</button>
+      <button class="btn primary" id="xlGo" disabled>Import</button></div>
+  </div></div>`);
+  document.body.appendChild(ov);
+  const close = () => ov.remove();
+  const fileEl = ov.querySelector('#xlFile');
+  const goEl = ov.querySelector('#xlGo');
+  const resEl = ov.querySelector('#xlResult');
+  let dataUrl = null;
+
+  ov.querySelector('#xlCancel').addEventListener('click', close);
+  ov.addEventListener('click', (ev) => { if (ev.target === ov) close(); });
+  // Plain navigation, like the PDF report downloads — the session cookie rides along.
+  ov.querySelector('#xlTemplate').addEventListener('click', () => {
+    window.open('/api/entries/import-excel/template', '_blank');
+  });
+
+  const summary = (r) => `<div class="card" style="margin:10px 0 0;padding:12px">
+    <div class="small"><b>${fmt(r.counts.pdi)}</b> PDI · <b>${fmt(r.counts.loading)}</b> Loading ·
+      <b>${fmt(r.counts.unloading)}</b> Un-Loading rows read</div>
+    <div class="small" style="margin-top:6px">
+      ${r.created.length ? `<span class="pill ok">${r.created.length} new day(s)</span> ` : ''}
+      ${r.updated.length ? `<span class="pill DRAFT">${r.updated.length} to update</span> ` : ''}
+      ${r.skipped.length ? `<span class="pill bad">${r.skipped.length} locked — skipped</span>` : ''}
+      ${!r.created.length && !r.updated.length ? `<span class="muted">Nothing to import.</span>` : ''}
+    </div>
+    ${r.skipped.length ? `<div class="small muted" style="margin-top:6px">Skipped:
+      ${r.skipped.map(s => esc(s.work_date) + ' (' + esc(s.status) + ')').join(', ')}</div>` : ''}
+    ${r.warnings.length ? `<div class="small" style="margin-top:6px;color:var(--warn)">
+      ${r.warnings.map(esc).join('<br>')}</div>` : ''}
+  </div>`;
+
+  fileEl.addEventListener('change', async () => {
+    const file = fileEl.files[0];
+    dataUrl = null; goEl.disabled = true; resEl.innerHTML = '';
+    if (!file) return;
+    resEl.innerHTML = `<div class="small muted" style="margin-top:8px">Reading…</div>`;
+    try {
+      dataUrl = await new Promise((resolve, reject) => {
+        const fr = new FileReader();
+        fr.onload = () => resolve(fr.result);
+        fr.onerror = () => reject(new Error('Could not read that file.'));
+        fr.readAsDataURL(file);
+      });
+      const r = await api('/entries/import-excel', { method: 'POST', body: { dataUrl, commit: false } });
+      resEl.innerHTML = summary(r);
+      goEl.disabled = !(r.created.length || r.updated.length);
+    } catch (err) {
+      resEl.innerHTML = `<div class="small" style="margin-top:8px;color:var(--bad)">${esc(err.message)}</div>`;
+    }
+  });
+
+  goEl.addEventListener('click', async () => {
+    if (!dataUrl) return;
+    goEl.disabled = true; goEl.textContent = 'Importing…';
+    try {
+      const r = await api('/entries/import-excel', { method: 'POST', body: { dataUrl, commit: true } });
+      toast(`Imported ${r.created.length + r.updated.length} day(s)` +
+        (r.skipped.length ? ` · ${r.skipped.length} locked day(s) skipped` : ''), 'ok');
+      close();
+      if (onDone) onDone();
+      refreshBadges();
+    } catch (err) {
+      toast(err.message, 'bad');
+      goEl.disabled = false; goEl.textContent = 'Import';
+    }
+  });
+}
+
 ROUTES.entry = async function () {
   const v = $('#view');
   v.innerHTML = topbar('Daily Operations Entry', 'Record the day, then submit for JMC end-of-day approval.') +
@@ -516,9 +640,11 @@ ROUTES.entry = async function () {
        <div><label class="small">Operating date</label><input type="date" id="wDate" value="${todayStr()}" style="width:auto"></div>
        <div><label class="small">Shift</label><select id="wShift" style="width:auto"><option>DAY</option><option>NIGHT</option></select></div>
        <button class="btn ghost" id="loadDay">Load date</button>
+       <button class="btn ghost" id="uploadExcel">⬆ Upload Excel</button>
        <span id="statusPill"></span>
      </div></div><div id="entryForm"></div>`;
   $('#loadDay').addEventListener('click', loadDay);
+  $('#uploadExcel').addEventListener('click', () => uploadExcelModal(loadDay));
   loadDay();
 
   async function loadDay() {
@@ -529,8 +655,6 @@ ROUTES.entry = async function () {
     $('#statusPill').innerHTML = e ? `<span class="pill ${e.status}">${e.status}</span>` : `<span class="pill DRAFT">NEW</span>`;
     if (e && e.shift) $('#wShift').value = e.shift;
 
-    const mp = State.cfg.approvedManpower;
-    const mpVal = {}; if (e) e.manpower.forEach(m => mpVal[m.category] = m.actual_count);
     const L = e ? e.loading : {}, U = e ? e.unloading : {}, Q = e ? e.qc : {};
     const trips = e ? e.transport : [];
 
@@ -542,30 +666,20 @@ ROUTES.entry = async function () {
       ${e && e.status==='REJECTED' ? `<div class="card" style="border-left:4px solid var(--bad)"><b>Rejected by JMC.</b>
         <span class="muted">${esc(e.jmc_remarks||'Please correct and resubmit.')}</span></div>`:''}
 
-      <div class="card"><h3>👷 Manpower (Actual vs Approved baseline)</h3>
-        <div class="grid g4" id="mpGrid">
-          ${mp.map(c => `<div class="field"><label>${esc(c.label)} <span class="muted small">(MG ${c.approved})</span></label>
-            <input type="number" min="0" data-mp="${c.category}" value="${mpVal[c.category]??''}" placeholder="0" ${locked?'disabled':''}></div>`).join('')}
-        </div></div>
-
       <div class="grid g2">
         <div class="card"><h3>📦 Loading <span class="muted small">(per part)</span></h3>
           <div class="field"><label>Parts loaded</label><input type="number" min="0" id="lParts" value="${L.parts_qty||''}" ${locked?'disabled':''}></div>
-          <div class="row g2">
-            <div class="field"><label>Manpower used</label><input type="number" min="0" id="lMp" value="${L.manpower_count||''}" ${locked?'disabled':''}></div>
-            <div class="field"><label>Trucks loaded</label><input type="number" min="0" id="lTrucks" value="${L.truck_count||''}" ${locked?'disabled':''}></div>
-          </div></div>
+          <div class="field"><label>Trucks loaded</label><input type="number" min="0" id="lTrucks" value="${L.truck_count||''}" ${locked?'disabled':''}></div>
+        </div>
 
         <div class="card"><h3>🏗️ Unloading <span class="muted small">(per ton)</span></h3>
           <div class="row g2">
             <div class="field"><label>Trucks unloaded</label><input type="number" min="0" id="uTrucks" value="${U.truck_count||''}" ${locked?'disabled':''}></div>
             <div class="field"><label>Weight (Ton)</label><input type="number" min="0" step="0.01" id="uTon" value="${U.weight_ton||''}" ${locked?'disabled':''}></div>
-          </div>
-          <div class="field"><label>Manpower used</label><input type="number" min="0" id="uMp" value="${U.manpower_count||''}" ${locked?'disabled':''}></div></div>
+          </div></div>
       </div>
 
       <div class="card"><h3>🔎 PTL / Quality Check (PDI) <span class="muted small">(per part · MG ${mgTarget}/day)</span></h3>
-        <div class="field" style="max-width:220px"><label>QC Inspectors (manpower)</label><input type="number" min="0" id="qMp" value="${Q.manpower_count||''}" ${locked?'disabled':''}></div>
         <div class="tscroll" style="margin-top:8px"><table class="qctab"><thead><tr>
           <th style="min-width:120px">Part no.</th><th class="num">Checked</th><th class="num">Rejected</th><th class="num">Rework</th><th>Defect</th><th></th>
         </tr></thead><tbody id="qcRows"></tbody></table></div>
@@ -721,16 +835,15 @@ ROUTES.entry = async function () {
     });
 
     function collect() {
-      const manpower = [...document.querySelectorAll('[data-mp]')].map(i => ({ category: i.dataset.mp, actual_count: i.value }));
       const transport = [...tripsEl.querySelectorAll('.trip-row')].map(r => {
         const o = {}; r.querySelectorAll('[data-k]').forEach(i => o[i.dataset.k] = i.value); return o;
       }).filter(t => t.from_loc && t.to_loc && t.vehicle_type);
       return {
-        work_date: date, shift: $('#wShift').value, notes: $('#notes').value, manpower, transport,
+        work_date: date, shift: $('#wShift').value, notes: $('#notes').value, transport,
         ppm: $('#ppm') ? $('#ppm').value : '',
-        loading: { parts_qty: $('#lParts').value, manpower_count: $('#lMp').value, truck_count: $('#lTrucks').value },
-        unloading: { truck_count: $('#uTrucks').value, weight_ton: $('#uTon').value, manpower_count: $('#uMp').value },
-        qc: { manpower_count: $('#qMp').value, lines: readQcRows() },
+        loading: { parts_qty: $('#lParts').value, truck_count: $('#lTrucks').value },
+        unloading: { truck_count: $('#uTrucks').value, weight_ton: $('#uTon').value },
+        qc: { lines: readQcRows() },
       };
     }
     async function save(submit) {
@@ -776,8 +889,6 @@ ROUTES.approvals = async function () {
     const e = (await api('/entries/' + id)).entry;
     const canDecide = e.status === 'SUBMITTED' && ['JMC_APPROVER','ADMIN'].includes(State.user.role);
     const mgShort = e.qc.parts_qty > 0 && !e.mg_met;
-    const mpRows = e.manpower.map(m => `<tr><td>${esc(m.category)}</td><td class="num">${m.approved_count}</td>
-      <td class="num">${m.actual_count}</td><td><span class="pill ${m.actual_count>=m.approved_count?'ok':'bad'}">${m.actual_count>=m.approved_count?'OK':'Short'}</span></td></tr>`).join('');
     const tripRows = e.transport.length ? e.transport.map(t => `<tr><td>${esc(t.from_loc)} → ${esc(t.to_loc)}</td>
       <td>${esc(t.vehicle_type)}</td><td>${esc(t.trip_time||'—')}</td><td class="muted">${esc(t.remarks||'')}</td></tr>`).join('')
       : `<tr><td colspan="4" class="muted">No trips.</td></tr>`;
@@ -786,15 +897,12 @@ ROUTES.approvals = async function () {
       <div class="sectionhdr"><h3>${esc(e.work_date)} · <span class="pill ${e.status}">${e.status}</span></h3>
         <button class="btn ghost sm" id="closeRev">Close</button></div>
       <div class="grid g4 kpigrid" style="margin-bottom:12px">
-        <div class="kpi tint-brand"><div class="l">Loading parts</div><div class="v">${fmt(e.loading.parts_qty)}</div><div class="sub muted">${fmt(e.loading.truck_count)} trucks · ${fmt(e.loading.manpower_count)} MP</div></div>
+        <div class="kpi tint-brand"><div class="l">Loading parts</div><div class="v">${fmt(e.loading.parts_qty)}</div><div class="sub muted">${fmt(e.loading.truck_count)} trucks</div></div>
         <div class="kpi tint-brand"><div class="l">Unloading</div><div class="v">${fmt(e.unloading.weight_ton)}<small> ton</small></div><div class="sub muted">${fmt(e.unloading.truck_count)} trucks</div></div>
         <div class="kpi tint-${mgShort?'warn':'ok'}"><div class="l">QC parts</div><div class="v">${fmt(e.qc.parts_qty)}</div><div class="sub ${mgShort?'flag':'muted'}">${mgShort?('Below MG by '+e.mg_shortfall):'MG '+fmt(e.mg_target)+' met'}</div></div>
         <div class="kpi tint-brand"><div class="l">Transport</div><div class="v">${e.transport.length}</div><div class="sub muted">trips</div></div>
       </div>
-      <div class="grid g2">
-        <div><h4>Manpower</h4><table><thead><tr><th>Cat</th><th class="num">Appr</th><th class="num">Act</th><th>Status</th></tr></thead><tbody>${mpRows||'<tr><td colspan=4 class=muted>—</td></tr>'}</tbody></table></div>
-        <div><h4>Transport trips</h4><table><thead><tr><th>Route</th><th>Vehicle</th><th>Time</th><th>Remarks</th></tr></thead><tbody>${tripRows}</tbody></table></div>
-      </div>
+      <div><h4>Transport trips</h4><table><thead><tr><th>Route</th><th>Vehicle</th><th>Time</th><th>Remarks</th></tr></thead><tbody>${tripRows}</tbody></table></div>
       ${e.attachments && e.attachments.length ? `<h4 style="margin-top:12px">Proof photos (${e.attachments.length})</h4>
         <div class="inline" style="gap:10px;flex-wrap:wrap">${e.attachments.map(a=>`<a href="${a.url}" target="_blank">
           <img src="${a.url}" title="${esc(a.caption||'')}" style="width:90px;height:90px;object-fit:cover;border-radius:8px;border:1px solid var(--line)"></a>`).join('')}</div>`:''}
@@ -886,18 +994,19 @@ ROUTES.requests = async function () {
 // ===========================================================================
 ROUTES.reports = async function () {
   const v = $('#view');
-  v.innerHTML = topbar('Monthly Report', 'Consolidated quantities and MG tracking.') +
+  const pp = periodPicker(load);
+  v.innerHTML = topbar('Operations Report', 'Consolidated quantities and MG tracking.') +
     `<div class="card noprint"><div class="btn-row">
-       <label class="small" style="margin:0">Month</label><input type="month" id="repMonth" value="${monthStr()}" style="width:auto">
+       ${pp.html}
        <button class="btn ghost" id="csvBtn">⬇ Export CSV</button></div></div>
      <div id="repBody"><div class="empty">Loading…</div></div>`;
-  $('#repMonth').addEventListener('change', load);
+  pp.wire();
   $('#csvBtn').addEventListener('click', exportCsv);
   let last = null;
   load();
 
   async function load() {
-    const s = await api('/summary?month=' + ($('#repMonth').value || monthStr())); last = s;
+    const s = await api('/summary?' + pp.query()); last = s;
     const t = s.totals;
     let html = `<div class="grid g4 kpigrid" style="margin-bottom:14px">
       <div class="kpi tint-brand"><div class="l">Loading parts</div><div class="v">${fmt(t.load_parts)}</div><div class="sub muted">${fmt(t.load_trucks)} trucks</div></div>
@@ -908,17 +1017,17 @@ ROUTES.reports = async function () {
     if (!s.days.length) html += `<div class="empty">No data.</div>`;
     else {
       html += `<table><thead><tr><th>Date</th><th>Status</th><th class="num">Load parts</th><th class="num">Load trucks</th>
-        <th class="num">Unload trucks</th><th class="num">Unload ton</th><th class="num">QC parts</th><th class="num">QC MP</th><th class="num">Trips</th><th>MG</th></tr></thead><tbody>`;
+        <th class="num">Unload trucks</th><th class="num">Unload ton</th><th class="num">QC parts</th><th class="num">Trips</th><th>MG</th></tr></thead><tbody>`;
       s.days.forEach(d => { const short = d.qc_parts>0 && d.qc_parts<s.mg_target;
         html += `<tr><td>${esc(d.work_date)}</td><td><span class="pill ${d.status}">${d.status}</span></td>
           <td class="num">${fmt(d.load_parts)}</td><td class="num">${fmt(d.load_trucks)}</td>
           <td class="num">${fmt(d.unload_trucks)}</td><td class="num">${fmt(d.unload_ton)}</td>
-          <td class="num">${fmt(d.qc_parts)}</td><td class="num">${fmt(d.qc_mp)}</td><td class="num">${fmt(d.trips)}</td>
+          <td class="num">${fmt(d.qc_parts)}</td><td class="num">${fmt(d.trips)}</td>
           <td>${d.qc_parts===0?'<span class="muted">—</span>':short?`<span class="pill bad">−${s.mg_target-d.qc_parts}</span>`:'<span class="pill ok">met</span>'}</td></tr>`; });
       html += `<tr style="font-weight:700;background:#f8fafc"><td colspan="2">TOTAL</td>
         <td class="num">${fmt(t.load_parts)}</td><td class="num">${fmt(t.load_trucks)}</td>
         <td class="num">${fmt(t.unload_trucks)}</td><td class="num">${fmt(t.unload_ton)}</td>
-        <td class="num">${fmt(t.qc_parts)}</td><td></td><td class="num">${fmt(t.trips)}</td><td></td></tr>`;
+        <td class="num">${fmt(t.qc_parts)}</td><td class="num">${fmt(t.trips)}</td><td></td></tr>`;
       html += `</tbody></table>`;
     }
     html += `</div>`;
@@ -926,12 +1035,12 @@ ROUTES.reports = async function () {
   }
   function exportCsv() {
     if (!last || !last.days.length) { toast('Nothing to export', 'bad'); return; }
-    const head = ['Date','Status','Load_parts','Load_trucks','Unload_trucks','Unload_ton','QC_parts','QC_MP','Trips','MP_actual'];
+    const head = ['Date','Status','Load_parts','Load_trucks','Unload_trucks','Unload_ton','QC_parts','Trips'];
     const lines = [head.join(',')].concat(last.days.map(d =>
-      [d.work_date,d.status,d.load_parts,d.load_trucks,d.unload_trucks,d.unload_ton,d.qc_parts,d.qc_mp,d.trips,d.mp_actual].join(',')));
+      [d.work_date,d.status,d.load_parts,d.load_trucks,d.unload_trucks,d.unload_ton,d.qc_parts,d.trips].join(',')));
     const blob = new Blob([lines.join('\n')], { type: 'text/csv' });
     const a = document.createElement('a'); a.href = URL.createObjectURL(blob);
-    a.download = `JMC_report_${last.month}.csv`; a.click();
+    a.download = `JMC_report_${pp.label().replace(/ /g, '')}.csv`; a.click();
   }
 };
 
@@ -1005,8 +1114,10 @@ ROUTES.capa = async function () {
       <td class="small ${c.overdue?'flag':''}">${esc(c.due_date||'—')}${c.overdue?' ⚠':''}</td>
       <td><span class="pill ${c.priority==='HIGH'?'bad':c.priority==='LOW'?'ok':''}" ${c.priority==='MEDIUM'?'style="background:#fef3c7;color:#92400e"':''}>${esc(c.priority)}</span></td>
       <td>${stPill(c.status)}</td>
-      <td class="right"><button class="btn ghost sm" data-edit="${c.id}">Open</button></td></tr>`).join('');
+      <td class="right"><button class="btn ghost sm" data-edit="${c.id}">Open</button>
+        ${adminDelBtn('capa', c.id)}</td></tr>`).join('');
     $('#cList').innerHTML = `<div class="card"><table><thead><tr><th>Title</th><th>Owner</th><th>Due</th><th>Priority</th><th>Status</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`;
+    wireAdminDel($('#cList'), load);
     $('#cList').querySelectorAll('[data-edit]').forEach(b=>b.addEventListener('click', ()=>{
       const c = r.capa.find(x=>String(x.id)===b.dataset.edit); if(c) capaModal(c, load); }));
   }
@@ -1209,6 +1320,144 @@ ROUTES.audit = async function () {
 };
 
 // ===========================================================================
+// DATA ADMIN (admin-only): correct or remove entered data, and restore it.
+// ===========================================================================
+
+// Admin-only inline delete button. Renders nothing for other roles, so the same
+// list markup serves everyone.
+function adminDelBtn(entity, id) {
+  return State.user.role === 'ADMIN'
+    ? `<button class="btn ghost sm" data-adel="${esc(entity)}:${Number(id)}">Delete</button>` : '';
+}
+
+// Wire every [data-adel] button inside `root`. `after` re-renders the list.
+function wireAdminDel(root, after) {
+  root.querySelectorAll('[data-adel]').forEach(b => b.addEventListener('click', async () => {
+    const [entity, id] = b.dataset.adel.split(':');
+    const reason = prompt('Delete this record?\n\nReason (min 5 characters) — required:');
+    if (reason === null) return;
+    try {
+      await api('/admin/' + entity, { method: 'DELETE', body: { ids: [Number(id)], reason } });
+      toast('Deleted — restore it from Data Admin → Recycle Bin', 'ok');
+      after();
+    } catch (e) { toast(e.message, 'err'); }
+  }));
+}
+
+ROUTES.archive = async function () {
+  const v = $('#view');
+  let tab = 'DAYS';
+  let month = new Date().toISOString().slice(0, 7);
+
+  function mount() {
+    v.innerHTML = topbar('Data Admin',
+        'Correct or remove entered data. Everything removed here can be restored.') +
+      `<div class="card"><div class="row" style="gap:8px">
+         <button class="btn ${tab==='DAYS'?'primary':'ghost'}" data-tab="DAYS">Days</button>
+         <button class="btn ${tab==='BIN'?'primary':'ghost'}" data-tab="BIN">Recycle Bin</button>
+       </div></div><div id="daBody"><div class="empty">Loading…</div></div>`;
+    v.querySelectorAll('[data-tab]').forEach(b =>
+      b.addEventListener('click', () => { tab = b.dataset.tab; mount(); }));
+    (tab === 'DAYS' ? renderDays : renderBin)();
+  }
+
+  async function renderDays() {
+    $('#daBody').innerHTML = `<div class="card">
+      <div class="row" style="gap:8px;align-items:end">
+        <div class="field"><label>Month</label>
+          <input type="month" id="daMonth" value="${esc(month)}"></div>
+        <button class="btn danger" id="daDel" disabled>Delete selected</button>
+      </div>
+      <div id="daDays" class="empty" style="margin-top:8px">Loading…</div></div>`;
+    $('#daMonth').addEventListener('change', (e) => { month = e.target.value; renderDays(); });
+
+    let days = [];
+    try {
+      days = (await api('/summary?month=' + encodeURIComponent(month))).days || [];
+    } catch (e) { $('#daDays').textContent = e.message; return; }
+    if (!days.length) { $('#daDays').textContent = 'No days recorded in this month.'; return; }
+
+    $('#daDays').outerHTML = `<div class="tscroll" style="margin-top:8px"><table><thead><tr>
+      <th></th><th>Date</th><th>Status</th><th>Load</th><th>Unload (t)</th><th>QC</th><th></th>
+      </tr></thead><tbody>${days.map(d => `<tr>
+        <td><input type="checkbox" class="daPick" value="${Number(d.id)}"
+             data-status="${esc(d.status)}"></td>
+        <td>${esc(d.work_date)}</td>
+        <td><span class="tag">${esc(d.status)}</span></td>
+        <td>${fmt(d.load_parts)}</td><td>${fmt(d.unload_ton)}</td><td>${fmt(d.qc_parts)}</td>
+        <td><button class="btn ghost sm" data-edit="${esc(d.work_date)}">Edit</button></td>
+      </tr>`).join('')}</tbody></table></div>`;
+
+    const picks = () => [...v.querySelectorAll('.daPick:checked')];
+    v.querySelectorAll('.daPick').forEach(c => c.addEventListener('change', () => {
+      $('#daDel').disabled = !picks().length;
+    }));
+    v.querySelectorAll('[data-edit]').forEach(b => b.addEventListener('click', () => {
+      location.hash = '#entry?date=' + encodeURIComponent(b.dataset.edit);
+    }));
+
+    $('#daDel').addEventListener('click', async () => {
+      const sel = picks();
+      // Billing sums every day in the period regardless of status, so removing
+      // an approved day silently moves the invoice. Say so before it happens.
+      const approved = sel.filter(c => c.dataset.status === 'APPROVED').length;
+      const warn = approved
+        ? `\n\n${approved} of ${sel.length} selected day(s) are approved by JMC. ` +
+          `Deleting them will change the ${month} invoice.`
+        : '';
+      const reason = prompt(
+        `Delete ${sel.length} day(s)?${warn}\n\nReason (min 5 characters) — required:`);
+      if (reason === null) return;
+      try {
+        const r = await api('/admin/daily_entry', {
+          method: 'DELETE', body: { ids: sel.map(c => Number(c.value)), reason },
+        });
+        toast(`Deleted ${r.deleted.length} day(s)` +
+              (r.failed.length ? `, ${r.failed.length} failed` : ''),
+              r.failed.length ? 'warn' : 'ok');
+        renderDays();
+      } catch (e) { toast(e.message, 'err'); }
+    });
+  }
+
+  async function renderBin() {
+    $('#daBody').innerHTML = `<div class="card"><div id="daBin" class="empty">Loading…</div></div>`;
+    let snaps = [];
+    try {
+      snaps = (await api('/admin/snapshots')).snapshots || [];
+    } catch (e) { $('#daBin').textContent = e.message; return; }
+    if (!snaps.length) {
+      $('#daBin').textContent = 'Nothing has been deleted or override-edited yet.';
+      return;
+    }
+    const KIND = { DELETE: 'Deleted', EDIT_BEFORE: 'Edited' };
+    $('#daBin').outerHTML = `<div class="tscroll"><table><thead><tr>
+      <th>When</th><th>What</th><th>Action</th><th>By</th><th>Reason</th><th></th>
+      </tr></thead><tbody>${snaps.map(s => `<tr>
+        <td class="small muted">${esc(String(s.taken_at||'').replace('T',' ').slice(0,16))}</td>
+        <td>${esc(s.label)}<div class="small muted">${esc(s.entity)}</div></td>
+        <td><span class="tag">${esc(KIND[s.kind] || s.kind)}</span></td>
+        <td>${esc(s.taken_by_name || '—')}</td>
+        <td class="small muted">${esc(s.reason)}</td>
+        <td>${s.restored_at
+              ? `<span class="small muted">Restored by ${esc(s.restored_by_name || '—')}</span>`
+              : `<button class="btn ghost sm" data-restore="${Number(s.id)}">Restore</button>`}</td>
+      </tr>`).join('')}</tbody></table></div>`;
+
+    v.querySelectorAll('[data-restore]').forEach(b => b.addEventListener('click', async () => {
+      b.disabled = true;
+      try {
+        const r = await api(`/admin/snapshots/${b.dataset.restore}/restore`, { method: 'POST' });
+        toast(`Restored ${r.label}`, 'ok');
+        renderBin();
+      } catch (e) { toast(e.message, 'err'); b.disabled = false; }
+    }));
+  }
+
+  mount();
+};
+
+// ===========================================================================
 // DISCREPANCIES (concern areas: dispatched vs billed, wrong part, QR, TPH+Hyzine)
 // ===========================================================================
 ROUTES.discrepancies = async function () {
@@ -1285,10 +1534,12 @@ ROUTES.discrepancies = async function () {
         <td class="right"><button class="btn ghost sm" data-capa="${d.id}" data-ctype="${esc(d.type)}" data-cpart="${esc(d.part_no||'')}" title="Raise a CAPA / 8D from this concern">＋ CAPA</button>
           ${d.status==='OPEN'&&canResolve
           ? ` <button class="btn ok sm" data-res="${d.id}">Resolve</button>`
-          : (d.resolution?` <span class="small muted" title="${esc(d.resolution)}">✓ ${esc(d.resolved_by_name||'')}</span>`:'')}</td></tr>`;
+          : (d.resolution?` <span class="small muted" title="${esc(d.resolution)}">✓ ${esc(d.resolved_by_name||'')}</span>`:'')}
+          ${adminDelBtn('discrepancy', d.id)}</td></tr>`;
     }).join('');
     $('#dList').innerHTML = `<div class="card"><table><thead><tr><th>Date</th><th>Type</th><th>Part</th>
       <th>Detail</th><th>Severity</th><th>Status</th><th>Raised by</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`;
+    wireAdminDel($('#dList'), load);
     $('#dList').querySelectorAll('[data-capa]').forEach(b=>b.addEventListener('click',()=>capaModal({ discrepancy_id:b.dataset.capa,
       title:`${DISC_TYPES[b.dataset.ctype]||b.dataset.ctype}${b.dataset.cpart?(' — '+b.dataset.cpart):''}` }, load)));
     $('#dList').querySelectorAll('[data-res]').forEach(b=>b.addEventListener('click', async ()=>{
@@ -1328,34 +1579,33 @@ function chartCard(title, sub, inner) {
 
 ROUTES.mis = async function () {
   const v = $('#view');
+  const pp = periodPicker(load);
   v.innerHTML = topbar('MIS Dashboard', `${State.cfg.company.provider} → ${State.cfg.company.client}`) +
     `<div class="card noprint"><div class="btn-row">
-       <label class="small" style="margin:0">Month</label><input type="month" id="misMonth" value="${monthStr()}" style="width:auto">
+       ${pp.html}
        <button class="btn ghost" id="misPrint">🖨 Print / Save PDF</button>
        <button class="btn ghost" id="misCsv">⬇ Export CSV</button>
      </div></div><div id="misBody"><div class="empty">Loading…</div></div>`;
-  $('#misMonth').addEventListener('change', load);
+  pp.wire();
   $('#misPrint').addEventListener('click', () => window.print());
   let M = null;
   $('#misCsv').addEventListener('click', () => {
     if (!M || !M.days.length) { toast('Nothing to export', 'bad'); return; }
-    const head = ['Date','Status','Load_parts','Load_trucks','Unload_trucks','Unload_ton','QC_parts','QC_MP','Trips','MP_actual'];
-    const lines = [head.join(',')].concat(M.days.map(d => [d.work_date,d.status,d.load_parts,d.load_trucks,d.unload_trucks,d.unload_ton,d.qc_parts,d.qc_mp,d.trips,d.mp_actual].join(',')));
+    const head = ['Date','Status','Load_parts','Load_trucks','Unload_trucks','Unload_ton','QC_parts','Trips'];
+    const lines = [head.join(',')].concat(M.days.map(d => [d.work_date,d.status,d.load_parts,d.load_trucks,d.unload_trucks,d.unload_ton,d.qc_parts,d.trips].join(',')));
     const blob = new Blob([lines.join('\n')], { type:'text/csv' });
-    const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `JMC_MIS_${M.month}.csv`; a.click();
+    const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `JMC_MIS_${pp.label().replace(/ /g, '')}.csv`; a.click();
   });
   load();
 
   async function load() {
-    const month = $('#misMonth').value || monthStr();
-    M = await api('/mis?month=' + month);
+    M = await api('/mis?' + pp.query());
     const t = M.totals;
-    if (!M.opDays) { $('#misBody').innerHTML = `<div class="card empty">No data recorded for ${esc(month)}.</div>`; return; }
+    if (!M.opDays) { $('#misBody').innerHTML = `<div class="card empty">No data recorded for ${esc(pp.label())}.</div>`; return; }
 
     // KPI strip
     const kpis = [
       ['tint-brand','Operating Days', M.opDays, `${t.approved_days} approved`],
-      ['tint-'+(M.utilization>=100?'ok':M.utilization>=80?'warn':'bad'),'Manpower Utilization', M.utilization+'%', `${M.avgMpPerDay.toFixed(1)} of ${M.approvedTotal}/day`],
       ['tint-'+(M.mgAchievement>=100?'ok':'warn'),'MG Achievement', M.mgAchievement+'%', `${t.mg_met_days}/${M.qcDays} QC days ≥ ${fmt(M.mgTarget)}`],
       ['tint-brand','QC Parts', fmt(t.qc_parts), 'checked this month'],
       ['tint-brand','Loading / Unloading', fmt(t.load_parts)+' / '+fmt(t.unload_ton)+'t', `${fmt(t.load_trucks)} / ${fmt(t.unload_trucks)} trucks`],
@@ -1364,7 +1614,7 @@ ROUTES.mis = async function () {
       ['tint-'+(M.discTot.variance!==0?'warn':'ok'),'Dispatch−Bill Variance', fmt(M.discTot.variance), `disp ${fmt(M.discTot.disp)} / bill ${fmt(M.discTot.bill)}`],
     ];
     let html = `<div class="printonly" style="margin-bottom:10px"><h2 style="margin:0">JMC Operations — MIS Report</h2>
-      <div class="muted small">${esc(State.cfg.company.provider)} · Month: ${esc(month)} · Generated ${new Date().toLocaleString('en-IN')}</div></div>`;
+      <div class="muted small">${esc(State.cfg.company.provider)} · Period: ${esc(pp.label())} · Generated ${new Date().toLocaleString('en-IN')}</div></div>`;
     html += `<div class="grid g4 kpigrid" style="margin-bottom:16px">` +
       kpis.map(k => `<div class="kpi ${k[0]}"><div class="l">${k[1]}</div><div class="v">${k[2]}</div><div class="sub muted">${k[3]}</div></div>`).join('') + `</div>`;
 
@@ -1402,20 +1652,6 @@ ROUTES.mis = async function () {
         html += chartCard('Defect Pareto', 'rejected parts by defect type', svgBars(dItems, { showVal:true }));
       }
     }
-
-    // Manpower utilization
-    const mpMap = Object.fromEntries(M.mpCat.map(m => [m.category, m]));
-    html += `<div class="card"><h3>Manpower Utilization <span class="muted small">avg actual vs approved (MG)</span></h3>
-      <table><thead><tr><th>Category</th><th class="num">Approved</th><th class="num">Avg Actual</th><th class="num">Util %</th><th style="width:40%">　</th></tr></thead><tbody>`;
-    M.approved.forEach(c => {
-      const avg = mpMap[c.category] ? mpMap[c.category].avg_actual : 0;
-      const util = c.approved ? Math.round((avg / c.approved) * 100) : 0;
-      const col = util >= 100 ? 'var(--ok)' : util >= 80 ? 'var(--warn)' : 'var(--bad)';
-      html += `<tr><td>${esc(c.label)}</td><td class="num">${c.approved}</td><td class="num">${avg.toFixed(1)}</td>
-        <td class="num">${util}%</td><td><div style="background:#eef2f7;border-radius:6px;height:12px;overflow:hidden">
-        <div style="width:${Math.min(util,100)}%;height:100%;background:${col}"></div></div></td></tr>`;
-    });
-    html += `</tbody></table></div>`;
 
     // Discrepancy analytics
     const typeItems = M.discByType.map(d => ({ label: (DISC_TYPES[d.type]||d.type).split(' ')[0], value: d.c, color:'#1565a8' }));
@@ -1559,9 +1795,11 @@ ROUTES.workers = async function () {
       <td>${esc(w.mobile||'—')}</td>
       <td class="small">${w.wage_type==='DAILY'?('₹'+fmt(w.daily_wage)+'/day'):('₹'+fmt(w.monthly_gross)+'/mo')}</td>
       <td><span class="pill ${w.status==='ACTIVE'?'ok':'bad'}">${w.status}</span></td>
-      <td class="right"><button class="btn ghost sm" data-w="${w.id}">${canManage?'Open':'View'}</button></td></tr>`).join('');
+      <td class="right"><button class="btn ghost sm" data-w="${w.id}">${canManage?'Open':'View'}</button>
+        ${adminDelBtn('worker', w.id)}</td></tr>`).join('');
     $('#wlist').innerHTML = `<div class="card"><table><thead><tr><th>Roll</th><th>Name</th><th>Dept</th><th>Mobile</th><th>Wage</th><th>Status</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`;
     $('#wlist').querySelectorAll('[data-w]').forEach(b => b.addEventListener('click', () => showForm(b.dataset.w)));
+    wireAdminDel($('#wlist'), loadList);
   }
 
   async function showForm(id) {
@@ -1892,8 +2130,9 @@ ROUTES.leave = async function () {
       const rows = r.leaves.map(l => `<tr><td>${esc(l.worker_name)}<div class="small muted">${esc(l.roll_no||'')}</div></td>
         <td>${esc(l.leave_type)}</td><td>${esc(l.from_date)} → ${esc(l.to_date)}</td><td class="num">${l.days}</td>
         <td class="small">${esc(l.reason||'')}</td><td><span class="pill ${l.status}">${l.status}</span></td>
-        <td class="right">${l.status==='PENDING'&&canDecide?`<button class="btn ok sm" data-ap="${l.id}">Approve</button> <button class="btn bad sm" data-rj="${l.id}">Reject</button>`:`<span class="small muted">${esc(l.decided_by_name||'')}</span>`}</td></tr>`).join('');
+        <td class="right">${l.status==='PENDING'&&canDecide?`<button class="btn ok sm" data-ap="${l.id}">Approve</button> <button class="btn bad sm" data-rj="${l.id}">Reject</button>`:`<span class="small muted">${esc(l.decided_by_name||'')}</span>`} ${adminDelBtn('leave', l.id)}</td></tr>`).join('');
       $('#lList').innerHTML = `<div class="card"><table><thead><tr><th>Blue Collar</th><th>Type</th><th>Period</th><th class="num">Days</th><th>Reason</th><th>Status</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`;
+      wireAdminDel($('#lList'), loadList);
       const decide = async (id, decision) => { let remarks=''; if(decision==='REJECT') remarks=prompt('Reason (optional):')||''; try { await api(`/leave/${id}/decision`,{method:'POST',body:{decision,remarks}}); toast('Leave '+decision.toLowerCase()+'d','ok'); loadList(); refreshBadges(); } catch(e){ toast(e.message,'bad'); } };
       $('#lList').querySelectorAll('[data-ap]').forEach(b=>b.addEventListener('click',()=>decide(b.dataset.ap,'APPROVE')));
       $('#lList').querySelectorAll('[data-rj]').forEach(b=>b.addEventListener('click',()=>decide(b.dataset.rj,'REJECT')));
