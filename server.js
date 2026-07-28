@@ -22,10 +22,12 @@ const calc = require('./calc');
 const reports = require('./lib/reports');
 const alerts = require('./lib/alerts');
 const pdf = require('./lib/pdf');
+const recycleBin = require('./lib/recycleBin');
 const mailer = require('./lib/mailer');
 const T = require('./lib/emailTemplate');
 const cors = require('cors'); // cross-origin access for the Capacitor Android WebView
 const { extractToken } = require('./lib/authToken'); // Bearer/query/cookie token resolver
+const excelImport = require('./lib/excelImport'); // JMC MIS workbook -> daily entries
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -320,13 +322,12 @@ async function clientConfig(user) {
 async function loadEntry(id) {
   const e = await db.prepare('SELECT * FROM daily_entries WHERE id = ?').get(id);
   if (!e) return null;
-  e.manpower = await db.prepare('SELECT category, approved_count, actual_count FROM manpower_actual WHERE entry_id = ?').all(id);
-  e.loading = (await db.prepare('SELECT parts_qty, manpower_count, truck_count FROM loading WHERE entry_id = ?').get(id))
-              || { parts_qty: 0, manpower_count: 0, truck_count: 0 };
-  e.unloading = (await db.prepare('SELECT truck_count, weight_ton, manpower_count FROM unloading WHERE entry_id = ?').get(id))
-              || { truck_count: 0, weight_ton: 0, manpower_count: 0 };
-  e.qc = (await db.prepare('SELECT parts_qty, manpower_count FROM qc WHERE entry_id = ?').get(id))
-              || { parts_qty: 0, manpower_count: 0 };
+  e.loading = (await db.prepare('SELECT parts_qty, truck_count FROM loading WHERE entry_id = ?').get(id))
+              || { parts_qty: 0, truck_count: 0 };
+  e.unloading = (await db.prepare('SELECT truck_count, weight_ton FROM unloading WHERE entry_id = ?').get(id))
+              || { truck_count: 0, weight_ton: 0 };
+  e.qc = (await db.prepare('SELECT parts_qty FROM qc WHERE entry_id = ?').get(id))
+              || { parts_qty: 0 };
   e.qc.lines = await db.prepare('SELECT id, part_no, checked_qty, rejected_qty, rework_qty, defect_type, remarks FROM qc_lines WHERE entry_id = ? ORDER BY id').all(id);
   // Derived quality metrics from the per-part lines (rejected / checked).
   const qcAgg = e.qc.lines.reduce((a, l) => {
@@ -381,12 +382,72 @@ app.get('/api/entry-by-date/:date', auth, async (req, res) => {
 // ---- Entries: create/update (Operator only, while editable) ---------------
 function isEditable(status) { return status === 'DRAFT' || status === 'REJECTED'; }
 
+// Write a day's operational sub-records (loading / unloading / QC lines) inside
+// an open transaction. Shared by the daily-entry form and the Excel importer so
+// both produce identical data. `manpower_count` columns are intentionally left
+// out of the SQL: manpower is no longer captured, so new rows take the column
+// default and existing values are left untouched rather than zeroed.
+async function writeEntryOps(tx, entryId, b) {
+  // A sub-record is written only when the caller supplies it, and a field only
+  // when it isn't undefined — undefined means "this source says nothing about
+  // it", so whatever is stored survives. The daily-entry form posts all three
+  // sections with every field (a blank input arrives as '' -> 0, an explicit
+  // zero); the Excel importer posts only what its sheets actually covered, so a
+  // workbook with no Un-Loading rows for a date can't wipe that date's tonnage.
+  const opt = (v) => (v === undefined || v === null ? null : Number(v) || 0);
+
+  if (b.loading) {
+    await tx.prepare(`INSERT INTO loading (entry_id, parts_qty, truck_count)
+                VALUES (?, COALESCE(?::int,0), COALESCE(?::int,0))
+                ON CONFLICT(entry_id) DO UPDATE SET
+                  parts_qty   = COALESCE(?::int, loading.parts_qty),
+                  truck_count = COALESCE(?::int, loading.truck_count)`)
+      .run(entryId, opt(b.loading.parts_qty), opt(b.loading.truck_count),
+                    opt(b.loading.parts_qty), opt(b.loading.truck_count));
+  }
+
+  if (b.unloading) {
+    await tx.prepare(`INSERT INTO unloading (entry_id, truck_count, weight_ton)
+                VALUES (?, COALESCE(?::int,0), COALESCE(?::float8,0))
+                ON CONFLICT(entry_id) DO UPDATE SET
+                  truck_count = COALESCE(?::int, unloading.truck_count),
+                  weight_ton  = COALESCE(?::float8, unloading.weight_ton)`)
+      .run(entryId, opt(b.unloading.truck_count), opt(b.unloading.weight_ton),
+                    opt(b.unloading.truck_count), opt(b.unloading.weight_ton));
+  }
+
+  // QC — per-part inspection lines roll up into the qc daily total.
+  if (b.qc) {
+    const Q = b.qc;
+    // A supplied `lines` array is authoritative, so clearing every row really
+    // does zero the day; only an absent array leaves the stored total alone.
+    const hasLines = Array.isArray(Q.lines);
+    let qcChecked = 0, qcRejected = 0, qcInserted = 0;
+    if (hasLines) {
+      await tx.prepare('DELETE FROM qc_lines WHERE entry_id = ?').run(entryId);
+      for (const ln of Q.lines) {
+        const chk = +ln.checked_qty || 0, rej = +ln.rejected_qty || 0, rw = +ln.rework_qty || 0;
+        if (chk === 0 && rej === 0 && rw === 0 && !ln.part_no) continue; // skip blank rows
+        qcChecked += chk; qcRejected += rej; qcInserted++;
+        await tx.prepare(`INSERT INTO qc_lines (entry_id, part_no, checked_qty, rejected_qty, rework_qty, defect_type, remarks)
+                                VALUES (?,?,?,?,?,?,?)`)
+          .run(entryId, ln.part_no || null, chk, rej, rw, ln.defect_type || null, ln.remarks || null);
+      }
+    }
+    const qcParts = hasLines ? qcChecked : opt(Q.parts_qty);
+    await tx.prepare(`INSERT INTO qc (entry_id, parts_qty) VALUES (?, COALESCE(?::int,0))
+                ON CONFLICT(entry_id) DO UPDATE SET parts_qty = COALESCE(?::int, qc.parts_qty)`)
+      .run(entryId, qcParts, qcParts);
+    // Auto-derive PPM from defects when inspection lines exist (overrides manual).
+    if (qcInserted && qcChecked > 0) {
+      await tx.prepare('UPDATE daily_entries SET ppm = ? WHERE id = ?').run(Math.round((qcRejected / qcChecked) * 1e6), entryId);
+    }
+  }
+}
+
 app.post('/api/entries', auth, requireRole('OPERATOR', 'ADMIN'), async (req, res) => {
   const b = req.body || {};
   if (!b.work_date) return res.status(400).json({ error: 'work_date required' });
-
-  const approved = await getSetting('approved_manpower', config.APPROVED_MANPOWER);
-  const approvedMap = Object.fromEntries(approved.map(a => [a.category, a.approved]));
 
   const run = db.transaction(async (tx) => {
     const ppmVal = (b.ppm != null && b.ppm !== '') ? Number(b.ppm) : null;
@@ -398,56 +459,38 @@ app.post('/api/entries', auth, requireRole('OPERATOR', 'ADMIN'), async (req, res
                      .get(b.work_date, b.shift || 'DAY', b.notes || null, ppmVal, req.user.id);
       entryId = row.id;
     } else {
-      if (!isEditable(entry.status))
+      // ADMIN may edit a locked day, but only deliberately: an explicit
+      // override flag plus a reason, with a pre-image snapshot taken first so
+      // the edit is as recoverable as a delete.
+      const override = b.admin_override === true && req.user.role === 'ADMIN';
+      if (!isEditable(entry.status) && !override)
         throw Object.assign(new Error('Entry is locked (already submitted/approved)'), { http: 409 });
       entryId = entry.id;
-      await tx.prepare(`UPDATE daily_entries SET shift=?, notes=?, ppm=?, status='DRAFT', updated_at=now() WHERE id=?`)
-        .run(b.shift || 'DAY', b.notes || null, ppmVal, entryId);
+      if (override) {
+        recycleBin.validateReason(b.reason);
+        await recycleBin.capture(tx, { entity: 'daily_entry', id: entryId,
+          kind: 'EDIT_BEFORE', reason: b.reason, userId: req.user.id });
+      }
+
+      // A normal edit reopens the day as DRAFT. An admin override defaults to
+      // sending it back to JMC — keep_approval must be opted into explicitly —
+      // so JMC is never billed for numbers they did not sign off on.
+      if (override && b.keep_approval === true) {
+        await tx.prepare(`UPDATE daily_entries SET shift=?, notes=?, ppm=?, updated_at=now() WHERE id=?`)
+          .run(b.shift || 'DAY', b.notes || null, ppmVal, entryId);
+      } else if (override) {
+        const note = `[Admin edit ${new Date().toISOString().slice(0, 10)}] ${String(b.reason).trim()}`;
+        await tx.prepare(`UPDATE daily_entries SET shift=?, notes=?, ppm=?, status='SUBMITTED',
+                          approved_by=NULL, approved_at=NULL, submitted_at=now(),
+                          jmc_remarks=?, updated_at=now() WHERE id=?`)
+          .run(b.shift || 'DAY', b.notes || null, ppmVal, note, entryId);
+      } else {
+        await tx.prepare(`UPDATE daily_entries SET shift=?, notes=?, ppm=?, status='DRAFT', updated_at=now() WHERE id=?`)
+          .run(b.shift || 'DAY', b.notes || null, ppmVal, entryId);
+      }
     }
 
-    // Manpower
-    await tx.prepare('DELETE FROM manpower_actual WHERE entry_id = ?').run(entryId);
-    for (const m of (b.manpower || [])) {
-      await tx.prepare(`INSERT INTO manpower_actual (entry_id, category, approved_count, actual_count) VALUES (?, ?, ?, ?)`)
-        .run(entryId, m.category, approvedMap[m.category] ?? 0, Number(m.actual_count) || 0);
-    }
-
-    // Loading
-    const L = b.loading || {};
-    await tx.prepare(`INSERT INTO loading (entry_id, parts_qty, manpower_count, truck_count) VALUES (?,?,?,?)
-                ON CONFLICT(entry_id) DO UPDATE SET parts_qty=excluded.parts_qty,
-                manpower_count=excluded.manpower_count, truck_count=excluded.truck_count`)
-      .run(entryId, +L.parts_qty || 0, +L.manpower_count || 0, +L.truck_count || 0);
-
-    // Unloading
-    const U = b.unloading || {};
-    await tx.prepare(`INSERT INTO unloading (entry_id, truck_count, weight_ton, manpower_count) VALUES (?,?,?,?)
-                ON CONFLICT(entry_id) DO UPDATE SET truck_count=excluded.truck_count,
-                weight_ton=excluded.weight_ton, manpower_count=excluded.manpower_count`)
-      .run(entryId, +U.truck_count || 0, +U.weight_ton || 0, +U.manpower_count || 0);
-
-    // QC — per-part inspection lines roll up into the qc daily total.
-    const Q = b.qc || {};
-    await tx.prepare('DELETE FROM qc_lines WHERE entry_id = ?').run(entryId);
-    let qcChecked = 0, qcRejected = 0, qcInserted = 0;
-    for (const ln of (Array.isArray(Q.lines) ? Q.lines : [])) {
-      const chk = +ln.checked_qty || 0, rej = +ln.rejected_qty || 0, rw = +ln.rework_qty || 0;
-      if (chk === 0 && rej === 0 && rw === 0 && !ln.part_no) continue; // skip blank rows
-      qcChecked += chk; qcRejected += rej; qcInserted++;
-      await tx.prepare(`INSERT INTO qc_lines (entry_id, part_no, checked_qty, rejected_qty, rework_qty, defect_type, remarks)
-                              VALUES (?,?,?,?,?,?,?)`)
-        .run(entryId, ln.part_no || null, chk, rej, rw, ln.defect_type || null, ln.remarks || null);
-    }
-    // With detailed lines, parts_qty = total checked; otherwise the single field.
-    const qcParts = qcInserted ? qcChecked : (+Q.parts_qty || 0);
-    await tx.prepare(`INSERT INTO qc (entry_id, parts_qty, manpower_count) VALUES (?,?,?)
-                ON CONFLICT(entry_id) DO UPDATE SET parts_qty=excluded.parts_qty,
-                manpower_count=excluded.manpower_count`)
-      .run(entryId, qcParts, +Q.manpower_count || 0);
-    // Auto-derive PPM from defects when inspection lines exist (overrides manual).
-    if (qcInserted && qcChecked > 0) {
-      await tx.prepare('UPDATE daily_entries SET ppm = ? WHERE id = ?').run(Math.round((qcRejected / qcChecked) * 1e6), entryId);
-    }
+    await writeEntryOps(tx, entryId, b);
 
     // Transport
     await tx.prepare('DELETE FROM transport_trips WHERE entry_id = ?').run(entryId);
@@ -471,12 +514,91 @@ app.post('/api/entries', auth, requireRole('OPERATOR', 'ADMIN'), async (req, res
 
   try {
     const id = await run();
-    audit(req.user.id, b.submit ? 'ENTRY_SUBMIT' : 'ENTRY_SAVE', { date: b.work_date });
+    if (b.admin_override === true && req.user.role === 'ADMIN') {
+      audit(req.user.id, 'ENTRY_ADMIN_EDIT', { date: b.work_date,
+        reason: String(b.reason).trim(), keep_approval: b.keep_approval === true });
+    } else {
+      audit(req.user.id, b.submit ? 'ENTRY_SUBMIT' : 'ENTRY_SAVE', { date: b.work_date });
+    }
     if (b.submit) alerts.notifyRealtime('ENTRY_SUBMITTED', { work_date: b.work_date, by: req.user.name });
     res.json({ entry: await loadEntry(id) });
   } catch (err) {
     res.status(err.http || 500).json({ error: err.message });
   }
+});
+
+// Blank workbook in the exact layout the importer expects, pre-filled with the
+// active parts master so Part No can be picked from a dropdown. Three path
+// segments, so it can't be captured by GET /api/entries/:id.
+app.get('/api/entries/import-excel/template', auth, requireRole('OPERATOR', 'ADMIN'), async (req, res) => {
+  const parts = await db.prepare(
+    'SELECT part_no, category FROM pdi_parts WHERE active = true ORDER BY part_no').all();
+  const wb = excelImport.buildTemplate(parts);
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.setHeader('Content-Disposition', 'attachment; filename="JMC_daily_data_template.xlsx"');
+  await wb.xlsx.write(res);
+  res.end();
+});
+
+// ---- Excel bulk import (PDI / Loading / Un-Loading -> draft days) ----------
+// Two-phase: `commit:false` parses and reports what would happen without
+// touching the DB; `commit:true` writes. The file is re-sent for the commit so
+// no parsed state has to be held server-side between the two calls.
+app.post('/api/entries/import-excel', auth, requireRole('OPERATOR', 'ADMIN'), async (req, res) => {
+  const b = req.body || {};
+  let parsed;
+  try {
+    parsed = await excelImport.parse(b.dataUrl);
+  } catch (err) {
+    return res.status(400).json({ error: err.message });
+  }
+  if (!parsed.days.length) {
+    return res.status(400).json({ error: 'No dated PDI / Loading / Un-Loading rows found in this workbook.' });
+  }
+
+  if (!b.commit) {
+    const created = [], updated = [], skipped = [];
+    for (const d of parsed.days) {
+      const cur = await db.prepare('SELECT status FROM daily_entries WHERE work_date = ?').get(d.work_date);
+      if (!cur) created.push(d.work_date);
+      else if (isEditable(cur.status)) updated.push(d.work_date);
+      else skipped.push({ work_date: d.work_date, status: cur.status });
+    }
+    return res.json({ preview: true, counts: parsed.counts, warnings: parsed.warnings, created, updated, skipped });
+  }
+
+  // Re-check each day's status inside the transaction so a day submitted between
+  // preview and commit is still skipped rather than overwritten.
+  const run = db.transaction(async (tx) => {
+    const created = [], updated = [], skipped = [];
+    for (const d of parsed.days) {
+      const cur = await tx.prepare('SELECT id, status FROM daily_entries WHERE work_date = ?').get(d.work_date);
+      let entryId;
+      if (!cur) {
+        const row = await tx.prepare(`INSERT INTO daily_entries (work_date, status, shift, created_by)
+                                      VALUES (?, 'DRAFT', 'DAY', ?) RETURNING id`).get(d.work_date, req.user.id);
+        entryId = row.id;
+        created.push(d.work_date);
+      } else if (isEditable(cur.status)) {
+        entryId = cur.id;
+        await tx.prepare(`UPDATE daily_entries SET status='DRAFT', updated_at=now() WHERE id=?`).run(entryId);
+        updated.push(d.work_date);
+      } else {
+        skipped.push({ work_date: d.work_date, status: cur.status });
+        continue;
+      }
+      await writeEntryOps(tx, entryId, d);
+    }
+    return { created, updated, skipped };
+  // A month of PDI lines is well over a thousand inserts — far past Prisma's
+  // 5s default transaction timeout.
+  }, { timeout: 120000, maxWait: 15000 });
+
+  const r = await run();
+  audit(req.user.id, 'ENTRY_IMPORT_EXCEL', {
+    created: r.created.length, updated: r.updated.length, skipped: r.skipped.length, rows: parsed.counts,
+  });
+  res.json({ preview: false, counts: parsed.counts, warnings: parsed.warnings, ...r });
 });
 
 // ---- Photo attachments (proof of work) ------------------------------------
@@ -505,6 +627,75 @@ app.delete('/api/attachments/:id', auth, requireRole('OPERATOR', 'ADMIN'), async
   try { fs.unlinkSync(path.join(UPLOAD_DIR, a.filename)); } catch (_) {}
   await db.prepare('DELETE FROM attachments WHERE id = ?').run(a.id);
   res.json({ ok: true });
+});
+
+// ---- Admin data management (modify / delete with recovery) -----------------
+// Deletes here are real deletes, so every billing/report/MIS query stays
+// correct without a soft-delete filter anyone could forget. What makes them
+// reversible is the snapshot written first. See lib/recycleBin.js.
+
+app.delete('/api/admin/:entity', auth, requireRole('ADMIN'), async (req, res) => {
+  const { entity } = req.params;
+  const { ids, reason } = req.body || {};
+  try {
+    recycleBin.getEntity(entity);          // 422 on an unknown entity
+    recycleBin.validateReason(reason);     // 400 on a missing/short reason
+    if (!Array.isArray(ids) || !ids.length)
+      return res.status(400).json({ error: 'ids must be a non-empty array' });
+
+    // Per-id fault tolerance: one already-removed row must not roll back the
+    // other 29 days of a bulk undo.
+    const run = db.transaction(async (tx) => {
+      const deleted = [], failed = [];
+      for (const id of ids) {
+        try {
+          const r = await recycleBin.remove(tx, { entity, id, reason, userId: req.user.id });
+          deleted.push({ id: Number(id), label: r.label, snapshotId: r.snapshotId });
+        } catch (e) {
+          failed.push({ id: Number(id), error: e.message });
+        }
+      }
+      return { deleted, failed };
+    // A month of days with their QC lines is far past Prisma's 5s default.
+    }, { timeout: 120000, maxWait: 15000 });
+
+    const r = await run();
+    audit(req.user.id, 'ADMIN_DELETE',
+      { entity, count: r.deleted.length, labels: r.deleted.map((d) => d.label), reason });
+    res.json(r);
+  } catch (err) {
+    res.status(err.http || 500).json({ error: err.message });
+  }
+});
+
+app.get('/api/admin/snapshots', auth, requireRole('ADMIN'), async (req, res) => {
+  const { entity, kind } = req.query;
+  const limit = Math.min(Number(req.query.limit) || 200, 500);
+  let sql = `SELECT s.id, s.entity, s.kind, s.label, s.reason, s.taken_at, s.restored_at,
+                    tu.name AS taken_by_name, ru.name AS restored_by_name
+             FROM record_snapshots s
+             LEFT JOIN users tu ON tu.id = s.taken_by
+             LEFT JOIN users ru ON ru.id = s.restored_by
+             WHERE 1=1`;
+  const args = [];
+  if (entity) { sql += ' AND s.entity = ?'; args.push(entity); }
+  if (kind)   { sql += ' AND s.kind = ?';   args.push(kind); }
+  sql += ' ORDER BY s.taken_at DESC LIMIT ?';
+  args.push(limit);
+  res.json({ snapshots: await db.prepare(sql).all(...args) });
+});
+
+app.post('/api/admin/snapshots/:id/restore', auth, requireRole('ADMIN'), async (req, res) => {
+  const run = db.transaction(
+    async (tx) => recycleBin.restore(tx, Number(req.params.id), req.user.id),
+    { timeout: 120000, maxWait: 15000 });
+  try {
+    const r = await run();
+    audit(req.user.id, 'ADMIN_RESTORE', { entity: r.entity, label: r.label });
+    res.json({ ok: true, ...r });
+  } catch (err) {
+    res.status(err.http || 500).json({ error: err.message });
+  }
 });
 
 // ---- Discrepancies (concern areas) ----------------------------------------
@@ -617,8 +808,25 @@ app.post('/api/manpower-requests/:id/decision', auth, requireRole('HQ', 'ADMIN')
 });
 
 // ---- Reports / dashboard --------------------------------------------------
+// Resolve the period a report covers. Accepts either an explicit ?from=&to=
+// range or ?month=YYYY-MM (shorthand for that month's first and last day),
+// defaulting to the current month. Callers always filter on the inclusive
+// from..to range, so there is one query path whichever the client sent —
+// `month` stays in the response for callers that still think in months.
+function periodFrom(q = {}) {
+  const isDate = (s) => /^\d{4}-\d{2}-\d{2}$/.test(s || '');
+  if (isDate(q.from) && isDate(q.to)) {
+    const [from, to] = q.from <= q.to ? [q.from, q.to] : [q.to, q.from]; // tolerate a reversed pair
+    return { month: from.slice(0, 7), from, to };
+  }
+  const month = /^\d{4}-\d{2}$/.test(q.month || '') ? q.month : new Date().toISOString().slice(0, 7);
+  const [y, m] = month.split('-').map(Number);
+  const lastDay = new Date(Date.UTC(y, m, 0)).getUTCDate(); // day 0 of next month = last of this
+  return { month, from: `${month}-01`, to: `${month}-${String(lastDay).padStart(2, '0')}` };
+}
+
 app.get('/api/summary', auth, async (req, res) => {
-  const month = req.query.month || new Date().toISOString().slice(0, 7);
+  const period = periodFrom(req.query);
   const rows = await db.prepare(`
     SELECT e.id, e.work_date, e.status,
       COALESCE(l.parts_qty,0) load_parts, COALESCE(l.truck_count,0) load_trucks, COALESCE(l.manpower_count,0) load_mp,
@@ -630,8 +838,8 @@ app.get('/api/summary', auth, async (req, res) => {
     LEFT JOIN loading l ON l.entry_id = e.id
     LEFT JOIN unloading u ON u.entry_id = e.id
     LEFT JOIN qc q ON q.entry_id = e.id
-    WHERE substr(e.work_date,1,7) = ?
-    ORDER BY e.work_date`).all(month);
+    WHERE e.work_date >= ? AND e.work_date <= ?
+    ORDER BY e.work_date`).all(period.from, period.to);
 
   const mg = (await getSetting('mg', config.MG)).qc_daily_parts;
   const totals = rows.reduce((t, r) => {
@@ -644,7 +852,7 @@ app.get('/api/summary', auth, async (req, res) => {
   }, { load_parts:0, load_trucks:0, unload_trucks:0, unload_ton:0, qc_parts:0, trips:0, approved_days:0, mg_short_days:0 });
 
   const docCutoff = new Date(Date.now() + 45 * 86400000).toISOString().slice(0, 10);
-  res.json({ month, mg_target: mg, days: rows, totals,
+  res.json({ ...period, mg_target: mg, days: rows, totals,
     pending_approvals: (await db.prepare("SELECT COUNT(*)::int c FROM daily_entries WHERE status='SUBMITTED'").get()).c,
     pending_mp_requests: (await db.prepare("SELECT COUNT(*)::int c FROM manpower_requests WHERE status='PENDING'").get()).c,
     open_discrepancies: (await db.prepare("SELECT COUNT(*)::int c FROM discrepancies WHERE status='OPEN'").get()).c,
@@ -663,7 +871,8 @@ app.get('/api/billing', auth, requireRole('ADMIN', 'HQ'), async (req, res) => {
 
 // ---- MIS (management dashboard aggregation) -------------------------------
 app.get('/api/mis', auth, async (req, res) => {
-  const month = req.query.month || new Date().toISOString().slice(0, 7);
+  const period = periodFrom(req.query);
+  const { from, to } = period;
   const days = await db.prepare(`
     SELECT e.work_date, e.status, e.ppm,
       COALESCE(l.parts_qty,0) load_parts, COALESCE(l.truck_count,0) load_trucks, COALESCE(l.manpower_count,0) load_mp,
@@ -675,7 +884,7 @@ app.get('/api/mis', auth, async (req, res) => {
     LEFT JOIN loading l ON l.entry_id = e.id
     LEFT JOIN unloading u ON u.entry_id = e.id
     LEFT JOIN qc q ON q.entry_id = e.id
-    WHERE substr(e.work_date,1,7) = ? ORDER BY e.work_date`).all(month);
+    WHERE e.work_date >= ? AND e.work_date <= ? ORDER BY e.work_date`).all(from, to);
 
   const approved = await getSetting('approved_manpower', config.APPROVED_MANPOWER);
   const approvedTotal = approved.reduce((a, x) => a + x.approved, 0);
@@ -686,26 +895,26 @@ app.get('/api/mis', auth, async (req, res) => {
 
   const mpCat = await db.prepare(`SELECT category, COUNT(*)::int days, AVG(actual_count)::float avg_actual, SUM(actual_count)::int sum_actual
     FROM manpower_actual m JOIN daily_entries e ON e.id = m.entry_id
-    WHERE substr(e.work_date,1,7) = ? GROUP BY category`).all(month);
+    WHERE e.work_date >= ? AND e.work_date <= ? GROUP BY category`).all(from, to);
 
   const discByType = await db.prepare(`SELECT type, COUNT(*)::int c, SUM(CASE WHEN status='OPEN' THEN 1 ELSE 0 END)::int open_c
-    FROM discrepancies WHERE substr(disc_date,1,7) = ? GROUP BY type`).all(month);
+    FROM discrepancies WHERE disc_date >= ? AND disc_date <= ? GROUP BY type`).all(from, to);
   const discBySev = await db.prepare(`SELECT severity, COUNT(*)::int c FROM discrepancies
-    WHERE substr(disc_date,1,7) = ? GROUP BY severity`).all(month);
+    WHERE disc_date >= ? AND disc_date <= ? GROUP BY severity`).all(from, to);
   const discTot = await db.prepare(`SELECT COUNT(*)::int total, SUM(CASE WHEN status='OPEN' THEN 1 ELSE 0 END)::int open_c,
     COALESCE(SUM(qty_dispatched),0)::int disp, COALESCE(SUM(qty_billed),0)::int bill,
     COALESCE(SUM(COALESCE(qty_dispatched,0)-COALESCE(qty_billed,0)),0)::int variance
-    FROM discrepancies WHERE substr(disc_date,1,7) = ?`).get(month);
+    FROM discrepancies WHERE disc_date >= ? AND disc_date <= ?`).get(from, to);
 
   const trByVehicle = await db.prepare(`SELECT vehicle_type, COUNT(*)::int c
     FROM transport_trips t JOIN daily_entries e ON e.id = t.entry_id
-    WHERE substr(e.work_date,1,7) = ? GROUP BY vehicle_type ORDER BY c DESC`).all(month);
+    WHERE e.work_date >= ? AND e.work_date <= ? GROUP BY vehicle_type ORDER BY c DESC`).all(from, to);
   const trByRoute = await db.prepare(`SELECT from_loc || ' → ' || to_loc route, vehicle_type, COUNT(*)::int c
     FROM transport_trips t JOIN daily_entries e ON e.id = t.entry_id
-    WHERE substr(e.work_date,1,7) = ? GROUP BY from_loc, to_loc, vehicle_type ORDER BY c DESC`).all(month);
+    WHERE e.work_date >= ? AND e.work_date <= ? GROUP BY from_loc, to_loc, vehicle_type ORDER BY c DESC`).all(from, to);
 
   const mpReq = await db.prepare(`SELECT status, COUNT(*)::int c, COALESCE(SUM(extra_count),0)::int extra
-    FROM manpower_requests WHERE substr(req_date,1,7) = ? GROUP BY status`).all(month);
+    FROM manpower_requests WHERE req_date >= ? AND req_date <= ? GROUP BY status`).all(from, to);
 
   const totals = days.reduce((t, d) => {
     t.load_parts += d.load_parts; t.load_trucks += d.load_trucks;
@@ -723,13 +932,13 @@ app.get('/api/mis', auth, async (req, res) => {
   const utilization = approvedTotal ? Math.round((avgMpPerDay / approvedTotal) * 100) : 0;
   const mgAchievement = qcDays ? Math.round((totals.mg_met_days / qcDays) * 100) : 0;
 
-  // QC quality — derived from per-part inspection lines this month.
+  // QC quality — derived from per-part inspection lines in the period.
   const qcQ = await db.prepare(`SELECT COALESCE(SUM(checked_qty),0)::int checked, COALESCE(SUM(rejected_qty),0)::int rejected, COALESCE(SUM(rework_qty),0)::int rework
-    FROM qc_lines ql JOIN daily_entries e ON e.id = ql.entry_id WHERE substr(e.work_date,1,7) = ?`).get(month);
+    FROM qc_lines ql JOIN daily_entries e ON e.id = ql.entry_id WHERE e.work_date >= ? AND e.work_date <= ?`).get(from, to);
   const defectPareto = await db.prepare(`SELECT COALESCE(defect_type,'OTHER') defect_type, SUM(rejected_qty)::int qty
     FROM qc_lines ql JOIN daily_entries e ON e.id = ql.entry_id
-    WHERE substr(e.work_date,1,7) = ? AND rejected_qty > 0
-    GROUP BY COALESCE(defect_type,'OTHER') ORDER BY qty DESC`).all(month);
+    WHERE e.work_date >= ? AND e.work_date <= ? AND rejected_qty > 0
+    GROUP BY COALESCE(defect_type,'OTHER') ORDER BY qty DESC`).all(from, to);
   const qcQuality = {
     checked: qcQ.checked, rejected: qcQ.rejected, rework: qcQ.rework,
     passed: Math.max(0, qcQ.checked - qcQ.rejected - qcQ.rework),
@@ -738,7 +947,7 @@ app.get('/api/mis', auth, async (req, res) => {
     ppm_derived: qcQ.checked ? Math.round((qcQ.rejected / qcQ.checked) * 1e6) : null,
   };
 
-  res.json({ month, mgTarget, ppmTarget, ppmAvg, approved, approvedTotal, days, mpCat, discByType, discBySev, discTot,
+  res.json({ ...period, mgTarget, ppmTarget, ppmAvg, approved, approvedTotal, days, mpCat, discByType, discBySev, discTot,
     trByVehicle, trByRoute, mpReq, totals, opDays, qcDays, avgMpPerDay, utilization, mgAchievement,
     qcQuality, defectPareto });
 });
