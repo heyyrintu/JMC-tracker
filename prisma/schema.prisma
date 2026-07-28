@@ -409,3 +409,26 @@ model DeviceToken {
   @@index([userId], map: "idx_device_tokens_user")
   @@map("device_tokens")
 }
+
+// Pre-image of a record an ADMIN deleted or override-edited. Deletes are real
+// deletes, so every existing report/billing query stays correct untouched; this
+// table is what makes them reversible. `payload` holds the parent row plus all
+// child rows. Restored rows keep their snapshot with `restored_at` set, so the
+// archive reads as a two-way history rather than a queue that empties.
+// No FKs on taken_by/restored_by: a snapshot must outlive changes to the user
+// row, and names are rendered via LEFT JOIN.
+model RecordSnapshot {
+  id         Int       @id @default(autoincrement())
+  entity     String // daily_entry | worker | attendance | leave | discrepancy | capa
+  kind       String // DELETE | EDIT_BEFORE
+  label      String // human handle, e.g. '2026-07-14'
+  payload    Json
+  reason     String
+  takenBy    Int?      @map("taken_by")
+  takenAt    DateTime  @default(now()) @map("taken_at")
+  restoredAt DateTime? @map("restored_at")
+  restoredBy Int?      @map("restored_by")
+
+  @@index([entity, takenAt], map: "idx_record_snapshots_entity")
+  @@map("record_snapshots")
+}
