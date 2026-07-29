@@ -1347,8 +1347,10 @@ app.post('/api/workers/:id/offer-letter', auth, requireRole('HQ', 'ADMIN'), asyn
 app.get('/api/attendance', auth, requireRole(...DRONA_HR), async (req, res) => {
   const date = req.query.date || new Date().toISOString().slice(0, 10);
   const dept = req.query.department;
+  // a.id is NULL for workers with no record on this date — the UI uses that to
+  // decide whether there is anything an admin could delete.
   let sql = `SELECT w.id worker_id, w.roll_no, w.name, w.department,
-      a.status, a.in_time, a.out_time, a.ot_hours, a.remarks
+      a.id attendance_id, a.status, a.in_time, a.out_time, a.ot_hours, a.remarks
     FROM workers w
     LEFT JOIN attendance a ON a.worker_id = w.id AND a.work_date = ?
     WHERE w.status = 'ACTIVE' AND w.onboard_status = 'APPROVED'`;

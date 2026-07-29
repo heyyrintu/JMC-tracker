@@ -2050,8 +2050,12 @@ ROUTES.attendance = async function () {
       <td><input type="time" data-in value="${esc(w.in_time||'')}" ${dis} style="width:108px"></td>
       <td><input type="time" data-out value="${esc(w.out_time||'')}" ${dis} style="width:108px"></td>
       <td><input type="number" data-ot value="${w.ot_hours||''}" ${dis} style="width:64px" placeholder="0"></td>
-      <td><input data-rem value="${esc(w.remarks||'')}" ${dis} placeholder="—"></td></tr>`).join('');
-    $('#attTable').innerHTML = `<div class="card"><table><thead><tr><th>Roll</th><th>Blue Collar</th><th>Status</th><th>In</th><th>Out</th><th>OT</th><th>Remarks</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+      <td><input data-rem value="${esc(w.remarks||'')}" ${dis} placeholder="—"></td>
+      <td class="right">${w.attendance_id ? adminDelBtn('attendance', w.attendance_id) : ''}</td></tr>`).join('');
+    $('#attTable').innerHTML = `<div class="card"><table><thead><tr><th>Roll</th><th>Blue Collar</th><th>Status</th><th>In</th><th>Out</th><th>OT</th><th>Remarks</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`;
+    // Only rows with a saved record get a Delete — the grid lists every active
+    // worker, most of whom have nothing stored for this date.
+    wireAdminDel($('#attTable'), loadMark);
   }
   async function save() {
     const records = [...document.querySelectorAll('[data-wid]')].map(tr => ({ worker_id: tr.dataset.wid, status: tr.querySelector('[data-st]').value, in_time: tr.querySelector('[data-in]').value, out_time: tr.querySelector('[data-out]').value, ot_hours: tr.querySelector('[data-ot]').value, remarks: tr.querySelector('[data-rem]').value }));
