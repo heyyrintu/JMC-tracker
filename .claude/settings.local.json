@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "Bash(grep -oE 'pill \\\\$\\\\{[a-z]+\\\\}' public/app.js)",
-      "mcp__Claude_Preview__preview_start"
+      "mcp__Claude_Preview__preview_start",
+      "Bash(ls -la \"C:/Users/RintuMondal/Downloads/JMC_PDI_MIS_FINAL \\(2\\).xlsx\")"
     ]
   }
 }
