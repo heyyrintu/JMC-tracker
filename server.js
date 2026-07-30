@@ -754,8 +754,11 @@ app.post('/api/entries/:id/decision', auth, requireRole('JMC_APPROVER', 'ADMIN')
   const { decision, remarks } = req.body || {};
   const e = await db.prepare('SELECT * FROM daily_entries WHERE id = ?').get(Number(req.params.id));
   if (!e) return res.status(404).json({ error: 'Not found' });
-  if (e.status !== 'SUBMITTED')
-    return res.status(409).json({ error: 'Only submitted entries can be approved/rejected' });
+  // JMC/Admin can decide on a day that is still DRAFT — the operator's Submit
+  // step is a convenience, not a gate. Days already decided stay locked, so a
+  // decision is still made exactly once.
+  if (!['DRAFT', 'SUBMITTED'].includes(e.status))
+    return res.status(409).json({ error: 'Only draft or submitted entries can be approved/rejected' });
   if (!['APPROVE', 'REJECT'].includes(decision))
     return res.status(400).json({ error: 'decision must be APPROVE or REJECT' });
   const status = decision === 'APPROVE' ? 'APPROVED' : 'REJECTED';
@@ -1081,7 +1084,7 @@ function collectWorker(b) {
   return o;
 }
 
-app.post('/api/workers', auth, requireRole('OPERATOR', 'ADMIN'), async (req, res) => {
+app.post('/api/workers', auth, requireRole('OPERATOR', 'HQ', 'ADMIN'), async (req, res) => {
   const b = req.body || {};
   if (!b.name) return res.status(400).json({ error: 'Name is required' });
   const o = collectWorker(b);
@@ -1100,7 +1103,7 @@ app.post('/api/workers', auth, requireRole('OPERATOR', 'ADMIN'), async (req, res
   }
 });
 
-app.put('/api/workers/:id', auth, requireRole('OPERATOR', 'ADMIN'), async (req, res) => {
+app.put('/api/workers/:id', auth, requireRole('OPERATOR', 'HQ', 'ADMIN'), async (req, res) => {
   const w = await db.prepare('SELECT id FROM workers WHERE id = ?').get(Number(req.params.id));
   if (!w) return res.status(404).json({ error: 'Not found' });
   const o = collectWorker(req.body || {});
@@ -1141,7 +1144,7 @@ function saveDocument(dataUrl, prefix) {
   return { filename };
 }
 
-app.post('/api/workers/:id/photo', auth, requireRole('OPERATOR', 'ADMIN'), async (req, res) => {
+app.post('/api/workers/:id/photo', auth, requireRole('OPERATOR', 'HQ', 'ADMIN'), async (req, res) => {
   const w = await db.prepare('SELECT * FROM workers WHERE id=?').get(Number(req.params.id));
   if (!w) return res.status(404).json({ error: 'Not found' });
   const r = saveImage((req.body || {}).dataUrl, 'wphoto');
@@ -1152,7 +1155,7 @@ app.post('/api/workers/:id/photo', auth, requireRole('OPERATOR', 'ADMIN'), async
 });
 
 const DOC_SLOTS = ['AADHAAR', 'PAN', 'PASSBOOK', 'OTHER'];
-app.post('/api/workers/:id/documents', auth, requireRole('OPERATOR', 'ADMIN'), async (req, res) => {
+app.post('/api/workers/:id/documents', auth, requireRole('OPERATOR', 'HQ', 'ADMIN'), async (req, res) => {
   const w = await db.prepare('SELECT id FROM workers WHERE id=?').get(Number(req.params.id));
   if (!w) return res.status(404).json({ error: 'Not found' });
   const b = req.body || {};
@@ -1172,7 +1175,7 @@ app.post('/api/workers/:id/documents', auth, requireRole('OPERATOR', 'ADMIN'), a
   res.json({ ok: true });
 });
 
-app.delete('/api/worker-documents/:id', auth, requireRole('OPERATOR', 'ADMIN'), async (req, res) => {
+app.delete('/api/worker-documents/:id', auth, requireRole('OPERATOR', 'HQ', 'ADMIN'), async (req, res) => {
   const d = await db.prepare('SELECT * FROM worker_documents WHERE id=?').get(Number(req.params.id));
   if (!d) return res.status(404).json({ error: 'Not found' });
   try { fs.unlinkSync(path.join(UPLOAD_DIR, d.filename)); } catch (_) {}
@@ -1219,7 +1222,10 @@ function decideOnboarding(decision) {
   return async (req, res) => {
     const w = await db.prepare('SELECT * FROM workers WHERE id=?').get(Number(req.params.id));
     if (!w) return res.status(404).json({ error: 'Not found' });
-    if (w.onboard_status !== 'PENDING') return res.status(409).json({ error: 'Not pending approval' });
+    // HQ/Admin can decide directly on a DRAFT — the operator's Submit step
+    // (and its photo/document completeness check) is optional, not a gate.
+    if (!['DRAFT', 'PENDING'].includes(w.onboard_status))
+      return res.status(409).json({ error: 'Already decided — only draft or pending workers can be approved/rejected' });
     const status = decision === 'APPROVE' ? 'APPROVED' : 'REJECTED';
     await db.prepare("UPDATE workers SET onboard_status=?, approved_by=?, approved_at=now(), approval_remarks=? WHERE id=?")
       .run(status, req.user.id, (req.body || {}).remarks || null, w.id);

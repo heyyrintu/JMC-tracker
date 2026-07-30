@@ -3,7 +3,16 @@
     "allow": [
       "Bash(grep -oE 'pill \\\\$\\\\{[a-z]+\\\\}' public/app.js)",
       "mcp__Claude_Preview__preview_start",
-      "Bash(ls -la \"C:/Users/RintuMondal/Downloads/JMC_PDI_MIS_FINAL \\(2\\).xlsx\")"
+      "Bash(ls -la \"C:/Users/RintuMondal/Downloads/JMC_PDI_MIS_FINAL \\(2\\).xlsx\")",
+      "Bash(curl -s http://localhost:3000/healthz)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\\\\n\" http://localhost:3000/api/me)",
+      "Bash(npm test *)",
+      "Bash('C:\\\\Users\\\\RintuMondal/.claude/skills/gstack/browse/dist/browse' goto *)",
+      "Bash('C:\\\\Users\\\\RintuMondal/.claude/skills/gstack/browse/dist/browse' wait *)",
+      "Bash('C:\\\\Users\\\\RintuMondal/.claude/skills/gstack/browse/dist/browse' screenshot *)",
+      "Bash('C:\\\\Users\\\\RintuMondal/.claude/skills/gstack/browse/dist/browse' text *)",
+      "Bash('C:\\\\Users\\\\RintuMondal/.claude/skills/gstack/browse/dist/browse' js *)",
+      "Bash(node *)"
     ]
   }
 }

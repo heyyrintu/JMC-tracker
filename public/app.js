@@ -869,6 +869,7 @@ ROUTES.approvals = async function () {
   v.innerHTML = topbar('End-of-Day Approvals', 'Review submitted daily entries and approve or reject.') +
     `<div class="card"><div class="btn-row"><label class="small" style="margin:0">Show</label>
       <select id="aFilter" style="width:auto"><option value="SUBMITTED">Pending (submitted)</option>
+      <option value="DRAFT">Drafts (not yet submitted)</option>
       <option value="APPROVED">Approved</option><option value="REJECTED">Rejected</option><option value="">All</option></select></div></div>
     <div id="aList"><div class="empty">Loading…</div></div>`;
   $('#aFilter').addEventListener('change', load);
@@ -887,7 +888,8 @@ ROUTES.approvals = async function () {
 
   async function openEntry(id) {
     const e = (await api('/entries/' + id)).entry;
-    const canDecide = e.status === 'SUBMITTED' && ['JMC_APPROVER','ADMIN'].includes(State.user.role);
+    // Drafts are decidable too — waiting on the operator's Submit is optional.
+    const canDecide = ['DRAFT','SUBMITTED'].includes(e.status) && ['JMC_APPROVER','ADMIN'].includes(State.user.role);
     const mgShort = e.qc.parts_qty > 0 && !e.mg_met;
     const tripRows = e.transport.length ? e.transport.map(t => `<tr><td>${esc(t.from_loc)} → ${esc(t.to_loc)}</td>
       <td>${esc(t.vehicle_type)}</td><td>${esc(t.trip_time||'—')}</td><td class="muted">${esc(t.remarks||'')}</td></tr>`).join('')
@@ -1763,7 +1765,9 @@ const S = (label, id, opts, val, dis) => `<div class="field"><label>${label}</la
 const deb = (fn, ms) => { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; };
 
 ROUTES.workers = async function () {
-  const canManage = ['OPERATOR','ADMIN'].includes(State.user.role);
+  // HQ edits worker profiles too — they approve onboarding, so they must be
+  // able to fix a draft's gaps themselves (attendance canManage stays as-is).
+  const canManage = ['OPERATOR','HQ','ADMIN'].includes(State.user.role);
   const v = $('#view');
   const deep = State.openWorker; State.openWorker = null;  // deep-link from Onboarding queue
   if (deep) showForm(deep); else showList();
@@ -1847,6 +1851,9 @@ ROUTES.workers = async function () {
        <div id="woffer"></div>`:''}
       ${!ro?`<div class="btn-row" style="margin-bottom:20px"><button class="btn primary" id="wsave">${id?'Save changes':'Create Blue Collar'}</button></div>`:''}`;
     $('#wback').addEventListener('click', showList);
+    // Must be initialized before the renderDocs(w) call below — it's a const,
+    // so calling the (hoisted) function earlier hits the temporal dead zone.
+    const SLOTS = [['AADHAAR','Aadhaar card'],['PAN','PAN card'],['PASSBOOK','Passbook / cheque']];
     if (id) { renderDocs(w); renderBanner(w); }
     const pi = $('#wphotoInput');
     if (pi) pi.addEventListener('change', async () => { const f=pi.files[0]; if(!f) return;
@@ -1878,7 +1885,6 @@ ROUTES.workers = async function () {
             else { const r=await api('/workers',{method:'POST',body}); toast('Blue Collar created','ok'); showForm(r.id); } }
       catch(e){ toast(e.message,'bad'); }
     });
-    const SLOTS = [['AADHAAR','Aadhaar card'],['PAN','PAN card'],['PASSBOOK','Passbook / cheque']];
     function renderDocs(wk) {
       const docs = wk.documents || [];
       const todayISO = new Date().toISOString().slice(0,10);
@@ -1924,7 +1930,8 @@ ROUTES.workers = async function () {
       const canDecide = ['HQ','ADMIN'].includes(State.user.role);
       let actions = '';
       if ((st==='DRAFT'||st==='REJECTED') && canSubmit) actions += `<button class="btn primary sm" id="obSubmit">Submit for approval</button>`;
-      if (st==='PENDING' && canDecide) actions += `<button class="btn primary sm" id="obApprove">Approve</button><button class="btn ghost sm" id="obReject">Reject</button>`;
+      // HQ/Admin can approve/reject a DRAFT directly — no need to wait for Submit.
+      if ((st==='PENDING'||st==='DRAFT') && canDecide) actions += `<button class="btn primary sm" id="obApprove">Approve</button><button class="btn ghost sm" id="obReject">Reject</button>`;
       el.innerHTML = `<div class="card" style="border-left:4px solid ${meta[1]}">
         <div class="inline" style="justify-content:space-between;gap:12px;flex-wrap:wrap">
           <div><b style="color:${meta[1]}">Onboarding · ${meta[0]}</b><div class="small muted">${esc(meta[2])}</div></div>
@@ -2005,7 +2012,7 @@ ROUTES.onboarding = async function () {
       <td class="small">${w.wage_type==='DAILY'?('₹'+fmt(w.daily_wage)+'/day'):('₹'+fmt(w.monthly_gross)+'/mo')}</td>
       <td>${w.has_offer?'<span class="pill ok">Offer ✓</span>':'<span class="muted small">—</span>'}</td>
       <td class="right"><div class="btn-row" style="justify-content:flex-end;margin:0">
-        ${(tab==='PENDING'&&canDecide)?`<button class="btn primary sm" data-ap="${w.id}">Approve</button><button class="btn ghost sm" data-rj="${w.id}">Reject</button>`:''}
+        ${((tab==='PENDING'||tab==='DRAFT')&&canDecide)?`<button class="btn primary sm" data-ap="${w.id}">Approve</button><button class="btn ghost sm" data-rj="${w.id}">Reject</button>`:''}
         <button class="btn ghost sm" data-open="${w.id}">Open</button></div></td></tr>`).join('');
     $('#obList').innerHTML = `<div class="card"><table><thead><tr><th>Employee</th><th>Dept / role</th><th>Wage</th><th>Offer</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`;
     $('#obList').querySelectorAll('[data-open]').forEach(b=>b.addEventListener('click',()=>{ State.openWorker=b.dataset.open; State.route='workers'; renderApp(); }));
