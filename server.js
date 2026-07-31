@@ -28,6 +28,7 @@ const T = require('./lib/emailTemplate');
 const cors = require('cors'); // cross-origin access for the Capacitor Android WebView
 const { extractToken } = require('./lib/authToken'); // Bearer/query/cookie token resolver
 const excelImport = require('./lib/excelImport'); // JMC MIS workbook -> daily entries
+const insights = require('./lib/insights'); // analyst layer for the dashboard + MIS
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -314,6 +315,7 @@ async function clientConfig(user) {
     cfg.costs = await getSetting('costs', config.COSTS);
     cfg.invoice = await getSetting('invoice', config.INVOICE);
     cfg.alerts = await getSetting('alerts', config.ALERTS);
+    cfg.finance = await getSetting('finance', config.FINANCE);
   }
   return cfg;
 }
@@ -828,6 +830,58 @@ function periodFrom(q = {}) {
   return { month, from: `${month}-01`, to: `${month}-${String(lastDay).padStart(2, '0')}` };
 }
 
+// The equally-long window immediately before `period`, so every KPI can be
+// shown against a like-for-like baseline (a 7-day range compares to the prior
+// 7 days, a month to the equivalent span before it).
+function previousPeriod({ from, to }) {
+  const day = 86400000;
+  const a = new Date(from + 'T00:00:00Z').getTime();
+  const b = new Date(to + 'T00:00:00Z').getTime();
+  const span = b - a + day;
+  const iso = (t) => new Date(t).toISOString().slice(0, 10);
+  return { from: iso(a - span), to: iso(a - day) };
+}
+
+// Per-day rows for a window — the shape both /api/summary and /api/mis build on.
+function dayRows(from, to) {
+  return db.prepare(`
+    SELECT e.work_date, e.status, e.ppm,
+      COALESCE(l.parts_qty,0) load_parts, COALESCE(l.truck_count,0) load_trucks,
+      COALESCE(u.truck_count,0) unload_trucks, COALESCE(u.weight_ton,0) unload_ton,
+      COALESCE(q.parts_qty,0) qc_parts,
+      (SELECT COUNT(*)::int FROM transport_trips t WHERE t.entry_id = e.id) trips,
+      (SELECT COALESCE(SUM(actual_count),0)::int FROM manpower_actual m WHERE m.entry_id = e.id) mp_actual
+    FROM daily_entries e
+    LEFT JOIN loading l ON l.entry_id = e.id
+    LEFT JOIN unloading u ON u.entry_id = e.id
+    LEFT JOIN qc q ON q.entry_id = e.id
+    WHERE e.work_date >= ? AND e.work_date <= ? ORDER BY e.work_date`).all(from, to);
+}
+
+// Totals for a window, in the same shape the summary/MIS reducers produce.
+function totalsOf(rows, mgTarget) {
+  return rows.reduce((t, r) => {
+    t.load_parts += r.load_parts; t.load_trucks += r.load_trucks;
+    t.unload_trucks += r.unload_trucks; t.unload_ton += r.unload_ton;
+    t.qc_parts += r.qc_parts; t.trips += r.trips; t.mp_actual += r.mp_actual || 0;
+    if (r.status === 'APPROVED') t.approved_days++;
+    if (r.qc_parts > 0 && r.qc_parts < mgTarget) t.mg_short_days++;
+    if (r.qc_parts >= mgTarget) t.mg_met_days++;
+    return t;
+  }, { load_parts: 0, load_trucks: 0, unload_trucks: 0, unload_ton: 0, qc_parts: 0,
+       trips: 0, mp_actual: 0, approved_days: 0, mg_short_days: 0, mg_met_days: 0 });
+}
+
+// Movement of the headline volume KPIs against the previous window.
+function trendsOf(totals, prevTotals) {
+  const t = (k) => insights.trend(totals[k], prevTotals[k], { goodWhen: 'up' });
+  return {
+    qc_parts: t('qc_parts'), load_parts: t('load_parts'),
+    unload_ton: t('unload_ton'), trips: t('trips'),
+    mg_short_days: insights.trend(totals.mg_short_days, prevTotals.mg_short_days, { goodWhen: 'down' }),
+  };
+}
+
 app.get('/api/summary', auth, async (req, res) => {
   const period = periodFrom(req.query);
   const rows = await db.prepare(`
@@ -855,21 +909,59 @@ app.get('/api/summary', auth, async (req, res) => {
   }, { load_parts:0, load_trucks:0, unload_trucks:0, unload_ton:0, qc_parts:0, trips:0, approved_days:0, mg_short_days:0 });
 
   const docCutoff = new Date(Date.now() + 45 * 86400000).toISOString().slice(0, 10);
-  res.json({ ...period, mg_target: mg, days: rows, totals,
-    pending_approvals: (await db.prepare("SELECT COUNT(*)::int c FROM daily_entries WHERE status='SUBMITTED'").get()).c,
-    pending_mp_requests: (await db.prepare("SELECT COUNT(*)::int c FROM manpower_requests WHERE status='PENDING'").get()).c,
-    open_discrepancies: (await db.prepare("SELECT COUNT(*)::int c FROM discrepancies WHERE status='OPEN'").get()).c,
-    pending_leaves: (await db.prepare("SELECT COUNT(*)::int c FROM leave_applications WHERE status='PENDING'").get()).c,
-    pending_onboarding: (await db.prepare("SELECT COUNT(*)::int c FROM workers WHERE onboard_status='PENDING'").get()).c,
-    expiring_docs: (await db.prepare("SELECT COUNT(*)::int c FROM worker_documents WHERE expiry_date IS NOT NULL AND expiry_date <= ?").get(docCutoff)).c,
+  const today = new Date().toISOString().slice(0, 10);
+
+  // Like-for-like baseline so every headline KPI can carry a trend arrow.
+  const prev = previousPeriod(period);
+  const prevRows = await dayRows(prev.from, prev.to);
+  const prevTotals = totalsOf(prevRows, mg);
+
+  const pendingApprovals = (await db.prepare("SELECT COUNT(*)::int c FROM daily_entries WHERE status='SUBMITTED'").get()).c;
+  const openDiscrepancies = (await db.prepare("SELECT COUNT(*)::int c FROM discrepancies WHERE status='OPEN'").get()).c;
+  const expiringDocs = (await db.prepare("SELECT COUNT(*)::int c FROM worker_documents WHERE expiry_date IS NOT NULL AND expiry_date <= ?").get(docCutoff)).c;
+  const overdueCapa = (await db.prepare("SELECT COUNT(*)::int c FROM capa WHERE status NOT IN ('DONE','VERIFIED') AND due_date IS NOT NULL AND due_date < ?").get(today)).c;
+
+  const discTot = await db.prepare(`SELECT COUNT(*)::int total, COALESCE(SUM(CASE WHEN status='OPEN' THEN 1 ELSE 0 END),0)::int open_c,
+    COALESCE(SUM(COALESCE(qty_dispatched,0)-COALESCE(qty_billed,0)),0)::int variance
+    FROM discrepancies WHERE disc_date >= ? AND disc_date <= ?`).get(period.from, period.to);
+
+  const isClient = req.user.role === 'JMC_APPROVER';
+  const body = {
+    ...period, mg_target: mg, days: rows, totals,
+    previous: { ...prev, totals: prevTotals },
+    trends: trendsOf(totals, prevTotals),
+    open_discrepancies: openDiscrepancies,
     open_capa: (await db.prepare("SELECT COUNT(*)::int c FROM capa WHERE status NOT IN ('DONE','VERIFIED')").get()).c,
-    overdue_capa: (await db.prepare("SELECT COUNT(*)::int c FROM capa WHERE status NOT IN ('DONE','VERIFIED') AND due_date IS NOT NULL AND due_date < ?").get(new Date().toISOString().slice(0,10))).c });
+    overdue_capa: overdueCapa,
+    insights: insights.forRole(insights.buildInsights({
+      days: rows, prevDays: prevRows, mgTarget: mg,
+      ppmTarget: await getSetting('ppm_target', config.PPM_TARGET),
+      discTot, pendingApprovals, overdueCapa, expiringDocs,
+    }), req.user.role),
+  };
+
+  // Drona's own staffing and admin queues are not the client's business.
+  if (!isClient) {
+    body.pending_approvals = pendingApprovals;
+    body.pending_mp_requests = (await db.prepare("SELECT COUNT(*)::int c FROM manpower_requests WHERE status='PENDING'").get()).c;
+    body.pending_leaves = (await db.prepare("SELECT COUNT(*)::int c FROM leave_applications WHERE status='PENDING'").get()).c;
+    body.pending_onboarding = (await db.prepare("SELECT COUNT(*)::int c FROM workers WHERE onboard_status='PENDING'").get()).c;
+    body.expiring_docs = expiringDocs;
+  }
+  res.json(body);
 });
 
 // ---- Billing / Invoice / P&L (Drona internal) -----------------------------
 app.get('/api/billing', auth, requireRole('ADMIN', 'HQ'), async (req, res) => {
   const month = req.query.month || new Date().toISOString().slice(0, 7);
   res.json(await reports.computeBilling(month));
+});
+
+// Full internal P&L — same Drona-management-only gating as billing. Never
+// exposed to the JMC client or to floor operators.
+app.get('/api/finance', auth, requireRole('ADMIN', 'HQ'), async (req, res) => {
+  const month = req.query.month || new Date().toISOString().slice(0, 7);
+  res.json(await reports.computeFinance(month));
 });
 
 // ---- MIS (management dashboard aggregation) -------------------------------
@@ -904,7 +996,7 @@ app.get('/api/mis', auth, async (req, res) => {
     FROM discrepancies WHERE disc_date >= ? AND disc_date <= ? GROUP BY type`).all(from, to);
   const discBySev = await db.prepare(`SELECT severity, COUNT(*)::int c FROM discrepancies
     WHERE disc_date >= ? AND disc_date <= ? GROUP BY severity`).all(from, to);
-  const discTot = await db.prepare(`SELECT COUNT(*)::int total, SUM(CASE WHEN status='OPEN' THEN 1 ELSE 0 END)::int open_c,
+  const discTot = await db.prepare(`SELECT COUNT(*)::int total, COALESCE(SUM(CASE WHEN status='OPEN' THEN 1 ELSE 0 END),0)::int open_c,
     COALESCE(SUM(qty_dispatched),0)::int disp, COALESCE(SUM(qty_billed),0)::int bill,
     COALESCE(SUM(COALESCE(qty_dispatched,0)-COALESCE(qty_billed,0)),0)::int variance
     FROM discrepancies WHERE disc_date >= ? AND disc_date <= ?`).get(from, to);
@@ -950,7 +1042,15 @@ app.get('/api/mis', auth, async (req, res) => {
     ppm_derived: qcQ.checked ? Math.round((qcQ.rejected / qcQ.checked) * 1e6) : null,
   };
 
+  const prevP = previousPeriod(period);
+  const prevDays = await dayRows(prevP.from, prevP.to);
+  const prevTotals = totalsOf(prevDays, mgTarget);
+  const misInsights = insights.forRole(insights.buildInsights({
+    days, prevDays, mgTarget, ppmTarget, qcQuality, discTot, utilization,
+  }), req.user.role);
+
   res.json({ ...period, mgTarget, ppmTarget, ppmAvg, approved, approvedTotal, days, mpCat, discByType, discBySev, discTot,
+    previous: { ...prevP, totals: prevTotals }, trends: trendsOf(totals, prevTotals), insights: misInsights,
     trByVehicle, trByRoute, mpReq, totals, opDays, qcDays, avgMpPerDay, utilization, mgAchievement,
     qcQuality, defectPareto });
 });
@@ -969,6 +1069,7 @@ app.put('/api/settings', auth, requireRole('ADMIN'), async (req, res) => {
   if (b.transportRates) await setSetting('transport_rates', b.transportRates);
   if (b.leavePolicy) await setSetting('leave_policy', b.leavePolicy);
   if (b.alerts) await setSetting('alerts', b.alerts);
+  if (b.finance) await setSetting('finance', b.finance);
   audit(req.user.id, 'SETTINGS_UPDATE');
   res.json({ config: await clientConfig(req.user) });
 });
@@ -1474,21 +1575,7 @@ app.get('/api/leave/balances', auth, requireRole(...DRONA_HR), async (req, res) 
 // ---- Compliance: wage register --------------------------------------------
 app.get('/api/compliance/wage-register', auth, requireRole('ADMIN', 'HQ'), async (req, res) => {
   const month = req.query.month || new Date().toISOString().slice(0, 7);
-  const stdDays = config.WORKING_DAYS_PER_MONTH || 26;
-  const workers = await db.prepare("SELECT * FROM workers WHERE status='ACTIVE' AND onboard_status='APPROVED' ORDER BY department, name").all();
-  const att = await db.prepare(`SELECT worker_id, status, ot_hours FROM attendance WHERE substr(work_date,1,7)=?`).all(month);
-  const byW = {};
-  att.forEach(a => { const m = byW[a.worker_id] = byW[a.worker_id] || { p: 0, ot: 0 };
-    m.p += a.status === 'PRESENT' ? 1 : a.status === 'HALF_DAY' ? 0.5 : 0; m.ot += a.ot_hours || 0; });
-  let tot = { present: 0, gross: 0, ot: 0, pf: 0, esi: 0, net: 0 };
-  const rows = workers.map(w => {
-    const m = byW[w.id] || { p: 0, ot: 0 };
-    const r = calc.wageRow(w, m.p, m.ot, stdDays);
-    tot.present += m.p; tot.gross += r.gross; tot.ot += r.ot_pay; tot.pf += r.pf; tot.esi += r.esi; tot.net += r.net;
-    return { id: w.id, roll_no: w.roll_no, name: w.name, department: w.department, wage_type: w.wage_type,
-      present_days: m.p, ot_hours: m.ot, gross: r.gross, ot_pay: r.ot_pay, pf: r.pf, esi: r.esi, net: r.net };
-  });
-  res.json({ month, std_days: stdDays, rows, totals: tot });
+  res.json(await reports.computePayroll(month));
 });
 
 // ---- Compliance: document expiry ------------------------------------------

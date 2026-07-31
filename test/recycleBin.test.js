@@ -24,6 +24,23 @@ test('attendance declares its composite unique key', () => {
   assert.deepStrictEqual(rb.getEntity('attendance').unique, ['work_date', 'worker_id']);
 });
 
+test('worker declares roll_no, which carries a UNIQUE index', () => {
+  assert.deepStrictEqual(rb.getEntity('worker').unique, ['roll_no']);
+});
+
+test('an EDIT_BEFORE plan keeps child tables the snapshot left empty', () => {
+  // restore() clears every table listed in plan.children before re-inserting.
+  // A table missing from the list is never cleared, so rows added after the
+  // snapshot would survive and the restore would not match the pre-image.
+  const plan = rb.buildRestorePlan({
+    entity: 'daily_entry', kind: 'EDIT_BEFORE',
+    payload: rb.buildPayload({ entity: 'daily_entry', parent: DAY, children: KIDS }),
+  });
+  const tables = plan.children.map((c) => c.table);
+  assert.deepStrictEqual(tables, rb.getEntity('daily_entry').children);
+  assert.deepStrictEqual(plan.children.find((c) => c.table === 'transport_trips').rows, []);
+});
+
 test('validateReason trims and rejects short reasons', () => {
   assert.throws(() => rb.validateReason('  ok  '), (e) => e.http === 400);
   assert.throws(() => rb.validateReason(null), (e) => e.http === 400);

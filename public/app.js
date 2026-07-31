@@ -100,8 +100,8 @@ function toast(msg, kind = '') {
 const ROLE_NAV = {
   OPERATOR:     ['dashboard','entry','workers','onboarding','attendance','leave','compliance','discrepancies','capa','requests','reports','mis'],
   JMC_APPROVER: ['dashboard','approvals','discrepancies','capa','reports','mis'],
-  HQ:           ['dashboard','workers','onboarding','attendance','leave','compliance','discrepancies','capa','requests','reports','mis','billing'],
-  ADMIN:        ['dashboard','entry','workers','onboarding','attendance','leave','compliance','approvals','discrepancies','capa','requests','reports','mis','billing','settings','users','audit','archive'],
+  HQ:           ['dashboard','workers','onboarding','attendance','leave','compliance','discrepancies','capa','requests','reports','mis','billing','finance'],
+  ADMIN:        ['dashboard','entry','workers','onboarding','attendance','leave','compliance','approvals','discrepancies','capa','requests','reports','mis','billing','finance','settings','users','audit','archive'],
 };
 const NAV_META = {
   dashboard:{ic:'▤',label:'Dashboard'}, entry:{ic:'✎',label:'Daily Entry'},
@@ -111,6 +111,7 @@ const NAV_META = {
   capa:{ic:'🛠',label:'CAPA / 8D'},
   requests:{ic:'＋',label:'Manpower Requests'},
   reports:{ic:'▦',label:'Reports'}, mis:{ic:'▣',label:'MIS Dashboard'}, billing:{ic:'₹',label:'Billing'},
+  finance:{ic:'📈',label:'Finance'},
   settings:{ic:'⚙',label:'Settings'}, users:{ic:'◐',label:'Users'},
   audit:{ic:'🗒',label:'Audit Log'},
   archive:{ic:'🗃',label:'Data Admin'},
@@ -502,47 +503,88 @@ function passwordModal() {
 const ROUTES = {};
 ROUTES.dashboard = async function () {
   const v = $('#view');
-  const pp = periodPicker(loadDash);
+  const pp = periodPicker(() => reload());
   v.innerHTML = topbar('Operations Dashboard', `${State.cfg.company.provider} → ${State.cfg.company.client}`) +
     `<div class="btn-row" style="margin-bottom:14px">
        ${pp.html}
      </div><div id="dashBody"><div class="empty">Loading…</div></div>`;
+  const reload = () => paneLoad('#dashBody', loadDash);
   pp.wire();
-  loadDash();
+  reload();
 
   async function loadDash() {
+    destroyCharts();
     const s = await api('/summary?' + pp.query());
-    const t = s.totals;
-    const kpis = [
-      ['tint-brand','Loading Parts', fmt(t.load_parts), `${fmt(t.load_trucks)} trucks`],
-      ['tint-brand','Unloading', fmt(t.unload_ton)+' <small>ton</small>', `${fmt(t.unload_trucks)} trucks`],
-      ['tint-'+(t.mg_short_days>0?'warn':'ok'),'QC / PDI Parts', fmt(t.qc_parts), `MG ${fmt(s.mg_target)}/day · ${t.mg_short_days} day(s) below`],
-      ['tint-brand','Transport Trips', fmt(t.trips), 'this month'],
-      ['tint-'+(s.pending_approvals>0?'warn':'ok'),'Pending EOD Approvals', s.pending_approvals, 'awaiting JMC'],
-      ['tint-'+(s.pending_mp_requests>0?'warn':'ok'),'Pending MP Requests', s.pending_mp_requests, 'awaiting HQ'],
-      ['tint-'+(s.open_discrepancies>0?'bad':'ok'),'Open Discrepancies', s.open_discrepancies, 'concern areas'],
-    ];
-    let html = `<div class="grid g4 kpigrid" style="margin-bottom:16px">` +
-      kpis.map(k => `<div class="kpi ${k[0]}"><div class="l">${k[1]}</div><div class="v">${k[2]}</div><div class="sub muted">${k[3]}</div></div>`).join('') +
-      `</div>`;
+    const t = s.totals, tr = s.trends || {};
+    const qcDays = s.days.filter(d => d.qc_parts > 0).length;
+    const mgMet = qcDays ? Math.round(((qcDays - t.mg_short_days) / qcDays) * 100) : null;
 
-    // Recent days
-    html += `<div class="card"><h3>Daily Activity — ${esc(pp.label())}</h3>`;
-    if (!s.days.length) html += `<div class="empty">No entries recorded for this month yet.</div>`;
-    else {
-      html += `<table><thead><tr><th>Date</th><th>Status</th><th class="num">Load (parts)</th>
-        <th class="num">Unload (ton)</th><th class="num">QC (parts)</th><th class="num">Trips</th></tr></thead><tbody>`;
-      s.days.slice().reverse().forEach(d => {
-        const mgShort = d.qc_parts > 0 && d.qc_parts < s.mg_target;
-        html += `<tr><td>${esc(d.work_date)}</td><td><span class="pill ${d.status}">${d.status}</span></td>
-          <td class="num">${fmt(d.load_parts)}</td><td class="num">${fmt(d.unload_ton)}</td>
-          <td class="num ${mgShort?'flag':''}">${fmt(d.qc_parts)}${mgShort?' ⚠':''}</td>
-          <td class="num">${fmt(d.trips)}</td></tr>`;
-      });
-      html += `</tbody></table>`;
+    if (!s.days.length) {
+      $('#dashBody').innerHTML = `<div class="card empty">No entries recorded for ${esc(pp.label())} yet.</div>`;
+      return;
     }
-    html += `</div>`;
+
+    // ---- Headline KPIs (service delivery — no financials on this page) -----
+    let html = `<div class="grid g4 kpigrid" style="margin-bottom:16px">
+      ${kpiTile('brand', 'QC / PDI Parts', fmt(t.qc_parts), `over ${qcDays} inspection day(s)`, tr.qc_parts)}
+      ${kpiTile(mgMet === null ? 'brand' : (mgMet >= 100 ? 'ok' : mgMet >= 80 ? 'warn' : 'bad'),
+        'MG Achievement', mgMet === null ? '—' : mgMet + '%', `MG ${fmt(s.mg_target)}/day · ${t.mg_short_days} below`, tr.mg_short_days)}
+      ${kpiTile('brand', 'Loading Parts', fmt(t.load_parts), `${fmt(t.load_trucks)} trucks`, tr.load_parts)}
+      ${kpiTile('brand', 'Unloading', fmt(t.unload_ton) + ' <small>ton</small>', `${fmt(t.unload_trucks)} trucks`, tr.unload_ton)}
+    </div>`;
+
+    // ---- Analyst commentary ------------------------------------------------
+    html += `<div class="card accent"><h3>📌 Analyst Notes <span class="muted small">automatic findings for ${esc(pp.label())}</span></h3>
+      ${insightList(s.insights)}</div>`;
+
+    // ---- Output trend + day mix -------------------------------------------
+    html += `<div class="grid g2">
+      ${chartCanvas('dQc', 'QC / PDI Output', `daily parts vs the MG floor of ${fmt(s.mg_target)}`)}
+      ${chartCanvas('dMix', 'Day Status Mix', `${s.days.length} operating day(s)`)}
+    </div>`;
+
+    // ---- Operational health strip -----------------------------------------
+    const health = [
+      ['Open discrepancies', s.open_discrepancies, s.open_discrepancies > 0 ? 'bad' : 'ok'],
+      ['Open CAPA', s.open_capa, s.open_capa > 0 ? 'warn' : 'ok'],
+      ['Overdue CAPA', s.overdue_capa, s.overdue_capa > 0 ? 'bad' : 'ok'],
+      ['Approved days', `${t.approved_days}/${s.days.length}`, t.approved_days === s.days.length ? 'ok' : 'warn'],
+    ];
+    // Drona-internal queues — the server omits these entirely for the client.
+    if (s.pending_approvals != null) health.push(['Pending EOD approvals', s.pending_approvals, s.pending_approvals > 0 ? 'warn' : 'ok']);
+    if (s.pending_mp_requests != null) health.push(['Pending MP requests', s.pending_mp_requests, s.pending_mp_requests > 0 ? 'warn' : 'ok']);
+    if (s.pending_onboarding != null) health.push(['Pending onboarding', s.pending_onboarding, s.pending_onboarding > 0 ? 'warn' : 'ok']);
+    if (s.expiring_docs != null) health.push(['Documents expiring', s.expiring_docs, s.expiring_docs > 0 ? 'warn' : 'ok']);
+
+    html += `<div class="card"><h3>Operational Health</h3><div class="healthstrip">` +
+      health.map(([label, val, tone]) => `<div class="hchip ${tone}"><div class="hv">${val}</div><div class="hl">${label}</div></div>`).join('') +
+      `</div></div>`;
+
+    // ---- Recent activity ---------------------------------------------------
+    html += `<div class="card"><h3>Daily Activity — ${esc(pp.label())}</h3>
+      <div class="tscroll"><table><thead><tr><th>Date</th><th>Status</th><th class="num">Load (parts)</th>
+        <th class="num">Unload (ton)</th><th class="num">QC (parts)</th><th class="num">Trips</th></tr></thead><tbody>` +
+      s.days.slice().reverse().map(d => {
+        const mgShort = d.qc_parts > 0 && d.qc_parts < s.mg_target;
+        return `<tr><td>${esc(d.work_date)}</td><td><span class="pill ${d.status}">${d.status}</span></td>
+          <td class="num">${fmt(d.load_parts)}</td><td class="num">${fmt(d.unload_ton)}</td>
+          <td class="num ${mgShort ? 'flag' : ''}">${fmt(d.qc_parts)}${mgShort ? ' ⚠' : ''}</td>
+          <td class="num">${fmt(d.trips)}</td></tr>`;
+      }).join('') + `</tbody></table></div></div>`;
+
     $('#dashBody').innerHTML = html;
+
+    // Charts are created after the markup lands — the canvases must exist.
+    const labels = s.days.map(d => d.work_date.slice(8));
+    mkChart('dQc', lineCfg(labels, [{
+      label: 'QC parts', data: s.days.map(d => d.qc_parts),
+      borderColor: CHART.teal, backgroundColor: 'rgba(15,157,140,.14)',
+    }], { target: s.mg_target, targetLabel: `MG ${s.mg_target}` }));
+
+    const byStatus = s.days.reduce((a, d) => { a[d.status] = (a[d.status] || 0) + 1; return a; }, {});
+    const stTone = { APPROVED: CHART.green, SUBMITTED: CHART.blue, DRAFT: CHART.slate, REJECTED: CHART.red };
+    const stKeys = Object.keys(byStatus);
+    mkChart('dMix', doughnutCfg(stKeys, stKeys.map(k => byStatus[k]), stKeys.map(k => stTone[k] || CHART.slate)));
   }
 };
 
@@ -1149,6 +1191,18 @@ ROUTES.settings = async function () {
         <div class="field"><label>Overhead (₹/mo)</label><input type="number" id="costOh" value="${(c.costs||{}).overhead_monthly||0}"></div>
         <div class="field"><label>Transport (₹/mo · 0 = pass-through)</label><input type="number" id="costTr" value="${(c.costs||{}).transport_monthly||0}"></div>
       </div></div>
+     <div class="card"><h3>Finance <span class="muted small">(drives the Finance P&L)</span></h3>
+      <div class="grid g3">
+        <div class="field"><label>Employer PF % <span class="muted small">of basic</span></label><input type="number" step="0.01" id="finPf" value="${(c.finance||{}).employer_pf_pct||0}"></div>
+        <div class="field"><label>Employer ESI % <span class="muted small">of gross+OT</span></label><input type="number" step="0.01" id="finEsi" value="${(c.finance||{}).employer_esi_pct||0}"></div>
+        <div class="field"><label>Tax % <span class="muted small">of PBT</span></label><input type="number" step="0.01" id="finTax" value="${(c.finance||{}).tax_pct||0}"></div>
+        <div class="field"><label>Depreciation (₹/mo)</label><input type="number" id="finDep" value="${(c.finance||{}).depreciation_monthly||0}"></div>
+        <div class="field"><label>Amortisation (₹/mo)</label><input type="number" id="finAmort" value="${(c.finance||{}).amortisation_monthly||0}"></div>
+        <div class="field"><label>Interest (₹/mo)</label><input type="number" id="finInt" value="${(c.finance||{}).interest_monthly||0}"></div>
+      </div>
+      <h4 style="margin:14px 0 6px">Cost lines <span class="muted small">— site payroll and transport are computed automatically and are not listed here</span></h4>
+      <div id="finLines"></div>
+      <button class="btn ghost sm" id="finAdd" style="margin-top:8px">＋ Add cost line</button></div>
      <div class="card"><h3>Invoice</h3>
       <div class="grid g3">
         <div class="field"><label>GST %</label><input type="number" step="0.01" id="invGst" value="${(c.invoice||{}).gst_pct||0}"></div>
@@ -1197,6 +1251,30 @@ ROUTES.settings = async function () {
            <button class="btn ghost sm" id="pdiImpBtn" style="margin-top:6px">Import</button></div></details>
        <div id="pdiList" style="margin-top:12px;max-height:320px;overflow:auto"></div>
      </div>`;
+  // Cost lines are edited as a live list, so they are held in a local array and
+  // re-rendered on every add/remove rather than parsed back out of the DOM.
+  let finLines = ((c.finance || {}).cost_lines || []).map(l => ({ ...l }));
+  function renderFinLines() {
+    const el = $('#finLines'); if (!el) return;
+    el.innerHTML = finLines.length ? '' : '<div class="muted small">No cost lines — add overhead, rent, insurance and so on.</div>';
+    finLines.forEach((l, i) => {
+      const row = h(`<div class="inline" style="gap:8px;margin-bottom:6px">
+        <input data-fl="name" value="${esc(l.name || '')}" placeholder="Cost name" style="max-width:240px">
+        <input data-fl="amount" type="number" value="${Number(l.amount) || 0}" style="max-width:140px">
+        <select data-fl="type" style="width:auto"><option value="DIRECT" ${l.type !== 'INDIRECT' ? 'selected' : ''}>Direct</option><option value="INDIRECT" ${l.type === 'INDIRECT' ? 'selected' : ''}>Indirect</option></select>
+        <button class="btn ghost sm" data-flrm="${i}">✕</button></div>`);
+      row.querySelectorAll('[data-fl]').forEach(inp => inp.addEventListener('input', () => {
+        const k = inp.dataset.fl;
+        finLines[i][k] = k === 'amount' ? (Number(inp.value) || 0) : inp.value;
+      }));
+      row.querySelector('[data-flrm]').addEventListener('click', () => { finLines.splice(i, 1); renderFinLines(); });
+      el.appendChild(row);
+    });
+  }
+  renderFinLines();
+  const finAdd = $('#finAdd');
+  if (finAdd) finAdd.addEventListener('click', () => { finLines.push({ name: '', amount: 0, type: 'INDIRECT' }); renderFinLines(); });
+
   $('#saveSet').addEventListener('click', async () => {
     const approvedManpower = c.approvedManpower.map((m,i)=>({ ...m, approved: Number(document.querySelector(`[data-i="${i}"]`).value)||0 }));
     const body = {
@@ -1208,6 +1286,12 @@ ROUTES.settings = async function () {
       costs: { manpower_monthly:+$('#costMp').value||0, overhead_monthly:+$('#costOh').value||0, transport_monthly:+$('#costTr').value||0 },
       invoice: { gst_pct:+$('#invGst').value||0, gstin:$('#invGstin').value, bill_to:$('#invBillTo').value, notes:$('#invNotes').value },
       mgBilling: $('#mgBill').checked,
+      finance: {
+        cost_lines: finLines.filter(l => (l.name || '').trim()),
+        employer_pf_pct: +$('#finPf').value||0, employer_esi_pct: +$('#finEsi').value||0,
+        depreciation_monthly: +$('#finDep').value||0, amortisation_monthly: +$('#finAmort').value||0,
+        interest_monthly: +$('#finInt').value||0, tax_pct: +$('#finTax').value||0,
+      },
       alerts: {
         enabled: $('#alEnabled').checked, recipients: $('#alRecip').value.trim(),
         digest_hour: +$('#alHour').value||0, pnl_day_threshold: +$('#alPnlDay').value||0,
@@ -1556,6 +1640,128 @@ ROUTES.discrepancies = async function () {
 // ===========================================================================
 // MIS DASHBOARD (management info — charts + export)
 // ===========================================================================
+// ---- Charts (Chart.js, vendored in public/vendor) --------------------------
+// Instances are tracked so a re-render tears the old canvases down first —
+// Chart.js keeps its own resize/event listeners and would otherwise leak.
+const CHART = { brand:'#2f63c4', teal:'#0f9d8c', amber:'#d97706', red:'#dc2626',
+                green:'#1f9d55', blue:'#1565a8', purple:'#7c3aed', slate:'#94a3b8' };
+let _charts = [];
+function destroyCharts() { _charts.forEach(c => { try { c.destroy(); } catch (_) {} }); _charts = []; }
+const hasChart = () => typeof Chart !== 'undefined';
+
+if (hasChart()) {
+  Chart.defaults.font.family = "'IBM Plex Sans', system-ui, sans-serif";
+  Chart.defaults.font.size = 11;
+  Chart.defaults.color = '#64748b';
+  Chart.defaults.maintainAspectRatio = false;
+  Chart.defaults.plugins.legend.labels.usePointStyle = true;
+  Chart.defaults.plugins.legend.labels.boxWidth = 8;
+  Chart.defaults.plugins.tooltip.padding = 8;
+}
+
+// A titled card holding one canvas. `id` must be unique within the page.
+function chartCanvas(id, title, sub, height = 230) {
+  return `<div class="card"><h3>${esc(title)}${sub ? ` <span class="muted small">${esc(sub)}</span>` : ''}</h3>
+    <div class="chartbox" style="height:${height}px"><canvas id="${id}"></canvas></div></div>`;
+}
+function mkChart(id, cfg) {
+  const el = document.getElementById(id);
+  if (!el || !hasChart()) return null;
+  const c = new Chart(el, cfg);
+  _charts.push(c);
+  return c;
+}
+
+// Same card, but an explicit "nothing here" instead of an empty canvas when the
+// period has no rows to plot — a blank chart frame reads as a broken chart.
+function chartOrEmpty(id, title, sub, hasData, height = 230, emptyMsg = 'Nothing recorded in this period.') {
+  return hasData ? chartCanvas(id, title, sub, height)
+    : `<div class="card"><h3>${esc(title)}${sub ? ` <span class="muted small">${esc(sub)}</span>` : ''}</h3>
+       <div class="empty">${esc(emptyMsg)}</div></div>`;
+}
+
+const gridX = { grid: { display: false }, ticks: { maxRotation: 0, autoSkipPadding: 8 } };
+const gridY = { beginAtZero: true, grid: { color: 'rgba(148,163,184,.18)' }, border: { display: false } };
+
+// Line/area series. `target` draws a dashed reference line (MG, PPM target…).
+function lineCfg(labels, datasets, { target = null, targetLabel = '' } = {}) {
+  const sets = datasets.map(d => ({
+    tension: .35, borderWidth: 2, pointRadius: 0, pointHoverRadius: 4,
+    fill: d.fill !== false, ...d,
+  }));
+  if (target) sets.push({
+    label: targetLabel || 'Target', data: labels.map(() => target),
+    borderColor: CHART.red, borderDash: [5, 4], borderWidth: 1.4,
+    pointRadius: 0, fill: false,
+  });
+  return { type: 'line', data: { labels, datasets: sets },
+    options: { interaction: { mode: 'index', intersect: false },
+      scales: { x: gridX, y: gridY },
+      plugins: { legend: { display: sets.length > 1, position: 'bottom' } } } };
+}
+
+function barCfg(labels, datasets, { horizontal = false, stacked = false } = {}) {
+  return { type: 'bar',
+    data: { labels, datasets: datasets.map(d => ({ borderRadius: 3, borderSkipped: false, ...d })) },
+    options: { indexAxis: horizontal ? 'y' : 'x',
+      scales: { x: { ...(horizontal ? gridY : gridX), stacked }, y: { ...(horizontal ? gridX : gridY), stacked } },
+      plugins: { legend: { display: datasets.length > 1, position: 'bottom' } } } };
+}
+
+function doughnutCfg(labels, data, colors) {
+  return { type: 'doughnut',
+    data: { labels, datasets: [{ data, backgroundColor: colors, borderWidth: 2, borderColor: '#fff' }] },
+    options: { cutout: '62%', plugins: { legend: { position: 'right' } } } };
+}
+
+// ---- Trend + insight presentation ------------------------------------------
+// `t` is a trend object from lib/insights.js: { change, dir, good }.
+function trendBadge(t) {
+  if (!t || t.change === null) return `<span class="muted small">no prior period</span>`;
+  if (t.dir === 'flat') return `<span class="trend flat">▬ no change</span>`;
+  const cls = t.good === null ? 'flat' : (t.good ? 'up' : 'down');
+  return `<span class="trend ${cls}">${t.dir === 'up' ? '▲' : '▼'} ${Math.abs(t.change)}%</span>`;
+}
+
+const INS_ICON = { good: '✔', warn: '!', bad: '✕', info: 'i' };
+function insightList(items) {
+  if (!items || !items.length) return `<div class="empty">Not enough data in this period to draw findings.</div>`;
+  return `<ul class="insights">` + items.map(i => `<li class="ins ${esc(i.level)}">
+    <span class="ico">${INS_ICON[i.level] || 'i'}</span>
+    <div><b>${esc(i.title)}</b><div class="small">${esc(i.text)}</div></div></li>`).join('') + `</ul>`;
+}
+
+/**
+ * Run a pane's loader, replacing its "Loading…" placeholder with a readable
+ * error if it throws. Without this a failed fetch leaves the spinner on screen
+ * forever and the user has no idea why — a stale server missing a new route is
+ * the usual cause, so that hint is offered explicitly.
+ */
+async function paneLoad(targetSel, fn) {
+  try {
+    await fn();
+  } catch (e) {
+    const msg = (e && e.message) || 'Request failed';
+    const el = $(targetSel);
+    if (el) {
+      el.innerHTML = `<div class="card"><h3>Couldn't load this page</h3>
+        <p class="small flag" style="margin:6px 0">${esc(msg)}</p>
+        <p class="small muted">If the app was updated recently, the server may still be running the
+          previous build — restarting it usually clears this.</p>
+        <button class="btn ghost sm" id="paneRetry">Retry</button></div>`;
+      const r = $('#paneRetry');
+      if (r) r.addEventListener('click', () => { el.innerHTML = '<div class="empty">Loading…</div>'; paneLoad(targetSel, fn); });
+    }
+    toast(msg, 'bad');
+  }
+}
+
+// KPI tile with an optional trend badge underneath.
+function kpiTile(tone, label, value, sub, t) {
+  return `<div class="kpi tint-${tone}"><div class="l">${label}</div><div class="v">${value}</div>
+    <div class="sub muted">${sub || ''}${t ? ' ' + trendBadge(t) : ''}</div></div>`;
+}
+
 function svgBars(items, opts = {}) {
   const H = opts.height || 170, padB = 22, padT = 16, padX = 12;
   const max = Math.max(opts.target || 0, ...items.map(i => +i.value || 0), 1);
@@ -1581,13 +1787,14 @@ function chartCard(title, sub, inner) {
 
 ROUTES.mis = async function () {
   const v = $('#view');
-  const pp = periodPicker(load);
+  const pp = periodPicker(() => reload());
   v.innerHTML = topbar('MIS Dashboard', `${State.cfg.company.provider} → ${State.cfg.company.client}`) +
     `<div class="card noprint"><div class="btn-row">
        ${pp.html}
        <button class="btn ghost" id="misPrint">🖨 Print / Save PDF</button>
        <button class="btn ghost" id="misCsv">⬇ Export CSV</button>
      </div></div><div id="misBody"><div class="empty">Loading…</div></div>`;
+  const reload = () => paneLoad('#misBody', load);
   pp.wire();
   $('#misPrint').addEventListener('click', () => window.print());
   let M = null;
@@ -1598,45 +1805,81 @@ ROUTES.mis = async function () {
     const blob = new Blob([lines.join('\n')], { type:'text/csv' });
     const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `JMC_MIS_${pp.label().replace(/ /g, '')}.csv`; a.click();
   });
-  load();
+  reload();
 
   async function load() {
+    destroyCharts();
     M = await api('/mis?' + pp.query());
-    const t = M.totals;
+    const t = M.totals, tr = M.trends || {};
     if (!M.opDays) { $('#misBody').innerHTML = `<div class="card empty">No data recorded for ${esc(pp.label())}.</div>`; return; }
 
+    const labels = M.days.map(d => d.work_date.slice(8));
+
     // KPI strip
-    const kpis = [
-      ['tint-brand','Operating Days', M.opDays, `${t.approved_days} approved`],
-      ['tint-'+(M.mgAchievement>=100?'ok':'warn'),'MG Achievement', M.mgAchievement+'%', `${t.mg_met_days}/${M.qcDays} QC days ≥ ${fmt(M.mgTarget)}`],
-      ['tint-brand','QC Parts', fmt(t.qc_parts), 'checked this month'],
-      ['tint-brand','Loading / Unloading', fmt(t.load_parts)+' / '+fmt(t.unload_ton)+'t', `${fmt(t.load_trucks)} / ${fmt(t.unload_trucks)} trucks`],
-      ['tint-brand','Transport Trips', fmt(t.trips), 'this month'],
-      ['tint-'+(M.discTot.open_c>0?'bad':'ok'),'Open Discrepancies', M.discTot.open_c, `${M.discTot.total} total`],
-      ['tint-'+(M.discTot.variance!==0?'warn':'ok'),'Dispatch−Bill Variance', fmt(M.discTot.variance), `disp ${fmt(M.discTot.disp)} / bill ${fmt(M.discTot.bill)}`],
-    ];
     let html = `<div class="printonly" style="margin-bottom:10px"><h2 style="margin:0">JMC Operations — MIS Report</h2>
       <div class="muted small">${esc(State.cfg.company.provider)} · Period: ${esc(pp.label())} · Generated ${new Date().toLocaleString('en-IN')}</div></div>`;
-    html += `<div class="grid g4 kpigrid" style="margin-bottom:16px">` +
-      kpis.map(k => `<div class="kpi ${k[0]}"><div class="l">${k[1]}</div><div class="v">${k[2]}</div><div class="sub muted">${k[3]}</div></div>`).join('') + `</div>`;
+    html += `<div class="grid g4 kpigrid" style="margin-bottom:16px">
+      ${kpiTile('brand', 'Operating Days', M.opDays, `${t.approved_days} approved`)}
+      ${kpiTile(M.mgAchievement >= 100 ? 'ok' : 'warn', 'MG Achievement', M.mgAchievement + '%', `${t.mg_met_days}/${M.qcDays} QC days ≥ ${fmt(M.mgTarget)}`, tr.mg_short_days)}
+      ${kpiTile('brand', 'QC Parts', fmt(t.qc_parts), 'inspected this period', tr.qc_parts)}
+      ${kpiTile('brand', 'Loading', fmt(t.load_parts), `${fmt(t.load_trucks)} trucks`, tr.load_parts)}
+      ${kpiTile('brand', 'Unloading', fmt(t.unload_ton) + ' <small>ton</small>', `${fmt(t.unload_trucks)} trucks`, tr.unload_ton)}
+      ${kpiTile('brand', 'Transport Trips', fmt(t.trips), 'this period', tr.trips)}
+      ${kpiTile(M.discTot.open_c > 0 ? 'bad' : 'ok', 'Open Discrepancies', M.discTot.open_c, `${M.discTot.total} total`)}
+      ${kpiTile(M.discTot.variance !== 0 ? 'warn' : 'ok', 'Dispatch−Bill Variance', fmt(M.discTot.variance), `disp ${fmt(M.discTot.disp)} / bill ${fmt(M.discTot.bill)}`)}
+    </div>`;
 
-    // QC vs MG trend
-    const qcItems = M.days.map(d => ({ label: d.work_date.slice(8), value: d.qc_parts, color: (d.qc_parts>0&&d.qc_parts<M.mgTarget)?'#d97706':'#0f9d8c' }));
-    html += chartCard('QC / PDI Parts per Day', `vs MG ${fmt(M.mgTarget)}/day`, svgBars(qcItems, { target: M.mgTarget, targetLabel: 'MG '+M.mgTarget, showVal:false }));
+    // ---- Analyst commentary ------------------------------------------------
+    html += `<div class="card accent"><h3>📌 Analyst Notes <span class="muted small">automatic findings for ${esc(pp.label())}</span></h3>
+      ${insightList(M.insights)}</div>`;
 
-    // Loading & Unloading
-    html += `<div class="grid g2">`;
-    html += chartCard('Loading Parts per Day', '', svgBars(M.days.map(d=>({label:d.work_date.slice(8),value:d.load_parts})), {}));
-    html += chartCard('Unloading Tons per Day', '', svgBars(M.days.map(d=>({label:d.work_date.slice(8),value:d.unload_ton,color:'#1565a8'})), {}));
-    html += `</div>`;
+    // ---- Period-over-period comparison ------------------------------------
+    if (M.previous) {
+      const p = M.previous.totals;
+      const cmp = [
+        ['QC parts', t.qc_parts, p.qc_parts, tr.qc_parts],
+        ['Loading parts', t.load_parts, p.load_parts, tr.load_parts],
+        ['Unloading tons', t.unload_ton, p.unload_ton, tr.unload_ton],
+        ['Transport trips', t.trips, p.trips, tr.trips],
+        ['Days below MG', t.mg_short_days, p.mg_short_days, tr.mg_short_days],
+      ];
+      html += `<div class="card"><h3>Period Comparison <span class="muted small">vs ${esc(M.previous.from)} → ${esc(M.previous.to)}</span></h3>
+        <div class="tscroll"><table><thead><tr><th>Metric</th><th class="num">Previous</th><th class="num">Current</th><th class="num">Change</th></tr></thead><tbody>` +
+        cmp.map(([label, cur, prv, trd]) => `<tr><td>${label}</td><td class="num muted">${fmt(prv)}</td>
+          <td class="num"><b>${fmt(cur)}</b></td><td class="num">${trendBadge(trd)}</td></tr>`).join('') +
+        `</tbody></table></div></div>`;
+    }
 
-    // Trips/day
-    html += chartCard('Transport Trips per Day', '', svgBars(M.days.map(d=>({label:d.work_date.slice(8),value:d.trips,color:'#0b3d64'})), { showVal:true }));
+    // ---- Output trends -----------------------------------------------------
+    html += chartCanvas('mQc', 'QC / PDI Parts per Day', `vs MG ${fmt(M.mgTarget)}/day`, 250);
+    html += `<div class="grid g2">
+      ${chartCanvas('mLoad', 'Loading vs Unloading', 'parts and tons per day')}
+      ${chartCanvas('mTrips', 'Transport Trips per Day', '')}
+    </div>`;
 
-    // PPM trend
-    const ppmItems = M.days.filter(d => d.ppm != null).map(d => ({ label: d.work_date.slice(8), value: d.ppm, color: (M.ppmTarget && d.ppm > M.ppmTarget) ? '#dc2626' : '#1f9d55' }));
-    if (ppmItems.length) html += chartCard('PPM Trend', `target ${fmt(M.ppmTarget)} · avg ${M.ppmAvg!=null?fmt(M.ppmAvg):'—'} (lower is better)`,
-      svgBars(ppmItems, { target: M.ppmTarget, targetLabel: 'Target '+M.ppmTarget, showVal:true }));
+    const ppmDays = M.days.filter(d => d.ppm != null);
+    if (ppmDays.length) {
+      html += chartCanvas('mPpm', 'PPM Trend',
+        `target ${fmt(M.ppmTarget)} · avg ${M.ppmAvg != null ? fmt(M.ppmAvg) : '—'} (lower is better)`);
+    }
+
+    // ---- Manpower utilisation (was computed server-side but never shown) ----
+    if (M.approvedTotal > 0) {
+      const util = M.utilization;
+      html += `<div class="grid g2">
+        <div class="card"><h3>Manpower Utilisation <span class="muted small">deployed vs approved</span></h3>
+          <div class="healthstrip" style="margin-bottom:12px">
+            <div class="hchip ${util > 110 || util < 70 ? 'warn' : 'ok'}"><div class="hv">${util}%</div><div class="hl">utilisation</div></div>
+            <div class="hchip"><div class="hv">${fmt(Math.round(M.avgMpPerDay))}</div><div class="hl">avg deployed/day</div></div>
+            <div class="hchip"><div class="hv">${fmt(M.approvedTotal)}</div><div class="hl">approved headcount</div></div>
+          </div>
+          ${M.mpCat && M.mpCat.length ? `<div class="tscroll"><table><thead><tr><th>Category</th><th class="num">Days</th><th class="num">Avg/day</th><th class="num">Total</th></tr></thead><tbody>` +
+            M.mpCat.map(c => `<tr><td>${esc(c.category)}</td><td class="num">${c.days}</td><td class="num">${(+c.avg_actual).toFixed(1)}</td><td class="num">${fmt(c.sum_actual)}</td></tr>`).join('') +
+            `</tbody></table></div>` : '<div class="empty">No manpower recorded.</div>'}
+        </div>
+        ${chartOrEmpty('mMp', 'Deployment by Category', 'total headcount-days', M.mpCat && M.mpCat.length, 230, 'No manpower deployment recorded.')}
+      </div>`;
+    }
 
     // QC quality — inspection outcomes (from per-part PDI lines)
     const qq = M.qcQuality;
@@ -1650,38 +1893,89 @@ ROUTES.mis = async function () {
       html += `<div class="grid g4 kpigrid" style="margin:4px 0 16px">` +
         qkpis.map(k => `<div class="kpi ${k[0]}"><div class="l">${k[1]}</div><div class="v">${k[2]}</div><div class="sub muted">${k[3]}</div></div>`).join('') + `</div>`;
       if (M.defectPareto && M.defectPareto.length) {
-        const dItems = M.defectPareto.map(d => ({ label: d.defect_type, value: d.qty, color: '#dc2626' }));
-        html += chartCard('Defect Pareto', 'rejected parts by defect type', svgBars(dItems, { showVal:true }));
+        html += chartCanvas('mDefect', 'Defect Pareto', 'rejected parts by defect type, worst first');
       }
     }
 
     // Discrepancy analytics
-    const typeItems = M.discByType.map(d => ({ label: (DISC_TYPES[d.type]||d.type).split(' ')[0], value: d.c, color:'#1565a8' }));
-    const sevColor = { HIGH:'#dc2626', MEDIUM:'#d97706', LOW:'#1f9d55' };
-    const sevItems = M.discBySev.map(d => ({ label: d.severity, value: d.c, color: sevColor[d.severity]||'#64748b' }));
-    html += `<div class="grid g2">`;
-    html += chartCard('Discrepancies by Type', `${M.discTot.open_c} open / ${M.discTot.total} total`,
-      typeItems.length ? svgBars(typeItems, { showVal:true, height:150 }) : '<div class="empty">None.</div>');
-    html += chartCard('Discrepancies by Severity', '',
-      sevItems.length ? svgBars(sevItems, { showVal:true, height:150 }) : '<div class="empty">None.</div>');
-    html += `</div>`;
+    html += `<div class="grid g2">
+      ${chartOrEmpty('mDiscType', 'Discrepancies by Type', `${M.discTot.open_c} open / ${M.discTot.total} total`, M.discByType.length, 200, 'No discrepancies logged — nothing to break down.')}
+      ${chartOrEmpty('mDiscSev', 'Discrepancies by Severity', '', M.discBySev.length, 200, 'No discrepancies logged.')}
+    </div>`;
 
     // Transport breakdown
-    html += `<div class="grid g2">`;
-    html += chartCard('Trips by Vehicle', '', M.trByVehicle.length ? svgBars(M.trByVehicle.map(x=>({label:x.vehicle_type.split(' ')[0],value:x.c,color:'#0f9d8c'})),{showVal:true,height:150}) : '<div class="empty">None.</div>');
-    let routeTbl = `<div class="card"><h3>Trips by Route</h3>`;
-    routeTbl += M.trByRoute.length ? `<table><thead><tr><th>Route</th><th>Vehicle</th><th class="num">Trips</th></tr></thead><tbody>` +
-      M.trByRoute.map(r=>`<tr><td>${esc(r.route)}</td><td>${esc(r.vehicle_type)}</td><td class="num">${r.c}</td></tr>`).join('') + `</tbody></table>` : '<div class="empty">No trips.</div>';
-    routeTbl += `</div>`;
-    html += routeTbl + `</div>`;
+    html += `<div class="grid g2">
+      ${chartOrEmpty('mVeh', 'Trips by Vehicle', '', M.trByVehicle.length, 200, 'No transport trips recorded.')}
+      <div class="card"><h3>Trips by Route</h3>` +
+      (M.trByRoute.length ? `<div class="tscroll"><table><thead><tr><th>Route</th><th>Vehicle</th><th class="num">Trips</th></tr></thead><tbody>` +
+        M.trByRoute.map(r => `<tr><td>${esc(r.route)}</td><td>${esc(r.vehicle_type)}</td><td class="num">${r.c}</td></tr>`).join('') +
+        `</tbody></table></div>` : '<div class="empty">No trips.</div>') + `</div>
+    </div>`;
 
     // MP requests summary
     if (M.mpReq.length) {
-      html += `<div class="card"><h3>Extra Manpower Requests</h3><table><thead><tr><th>Status</th><th class="num">Requests</th><th class="num">Extra headcount</th></tr></thead><tbody>` +
-        M.mpReq.map(r=>`<tr><td><span class="pill ${r.status}">${r.status}</span></td><td class="num">${r.c}</td><td class="num">${r.extra}</td></tr>`).join('') + `</tbody></table></div>`;
+      html += `<div class="card"><h3>Extra Manpower Requests</h3><div class="tscroll"><table><thead><tr><th>Status</th><th class="num">Requests</th><th class="num">Extra headcount</th></tr></thead><tbody>` +
+        M.mpReq.map(r => `<tr><td><span class="pill ${r.status}">${r.status}</span></td><td class="num">${r.c}</td><td class="num">${r.extra}</td></tr>`).join('') + `</tbody></table></div></div>`;
     }
 
     $('#misBody').innerHTML = html;
+
+    // ---- Instantiate charts (canvases exist only after the markup lands) ---
+    mkChart('mQc', lineCfg(labels, [{
+      label: 'QC parts', data: M.days.map(d => d.qc_parts),
+      borderColor: CHART.teal, backgroundColor: 'rgba(15,157,140,.14)',
+    }], { target: M.mgTarget, targetLabel: `MG ${M.mgTarget}` }));
+
+    mkChart('mLoad', { ...barCfg(labels, [
+      { label: 'Loading parts', data: M.days.map(d => d.load_parts), backgroundColor: CHART.brand, yAxisID: 'y' },
+      { label: 'Unloading tons', data: M.days.map(d => d.unload_ton), backgroundColor: CHART.blue, yAxisID: 'y1' },
+    ]), options: {
+      scales: {
+        x: gridX,
+        y: { ...gridY, position: 'left', title: { display: true, text: 'parts' } },
+        y1: { ...gridY, position: 'right', grid: { drawOnChartArea: false }, title: { display: true, text: 'tons' } },
+      },
+      plugins: { legend: { position: 'bottom' } },
+    } });
+
+    mkChart('mTrips', barCfg(labels, [{ label: 'Trips', data: M.days.map(d => d.trips), backgroundColor: CHART.purple }]));
+
+    if (ppmDays.length) {
+      mkChart('mPpm', lineCfg(ppmDays.map(d => d.work_date.slice(8)), [{
+        label: 'PPM', data: ppmDays.map(d => d.ppm),
+        borderColor: CHART.amber, backgroundColor: 'rgba(217,119,6,.14)',
+      }], { target: M.ppmTarget, targetLabel: `Target ${M.ppmTarget}` }));
+    }
+
+    if (M.approvedTotal > 0 && M.mpCat && M.mpCat.length) {
+      mkChart('mMp', barCfg(M.mpCat.map(c => c.category), [{
+        label: 'Headcount-days', data: M.mpCat.map(c => c.sum_actual), backgroundColor: CHART.teal,
+      }], { horizontal: true }));
+    }
+
+    if (M.qcQuality && M.qcQuality.checked > 0 && M.defectPareto && M.defectPareto.length) {
+      mkChart('mDefect', barCfg(M.defectPareto.map(d => d.defect_type), [{
+        label: 'Rejected parts', data: M.defectPareto.map(d => d.qty), backgroundColor: CHART.red,
+      }], { horizontal: true }));
+    }
+
+    if (M.discByType.length) {
+      mkChart('mDiscType', doughnutCfg(
+        M.discByType.map(d => DISC_TYPES[d.type] || d.type),
+        M.discByType.map(d => d.c),
+        [CHART.brand, CHART.teal, CHART.amber, CHART.purple, CHART.slate]));
+    }
+    if (M.discBySev.length) {
+      const sevColor = { HIGH: CHART.red, MEDIUM: CHART.amber, LOW: CHART.green };
+      mkChart('mDiscSev', doughnutCfg(
+        M.discBySev.map(d => d.severity), M.discBySev.map(d => d.c),
+        M.discBySev.map(d => sevColor[d.severity] || CHART.slate)));
+    }
+    if (M.trByVehicle.length) {
+      mkChart('mVeh', barCfg(M.trByVehicle.map(x => x.vehicle_type), [{
+        label: 'Trips', data: M.trByVehicle.map(x => x.c), backgroundColor: CHART.teal,
+      }], { horizontal: true }));
+    }
   }
 };
 
@@ -1697,11 +1991,12 @@ ROUTES.billing = async function () {
        <button class="btn ghost" id="bInvoice">₹ GST invoice (PDF)</button>
        <button class="btn ghost" id="bPrint">🖨 Print</button></div></div>
      <div id="bBody"><div class="empty">Loading…</div></div>`;
-  $('#bMonth').addEventListener('change', load);
+  const reload = () => paneLoad('#bBody', load);
+  $('#bMonth').addEventListener('change', reload);
   $('#bPrint').addEventListener('click', () => window.print());
   $('#bReport').addEventListener('click', () => window.open('/api/reports/monthly.pdf?month=' + ($('#bMonth').value || monthStr()), '_blank'));
   $('#bInvoice').addEventListener('click', () => window.open('/api/invoice.pdf?month=' + ($('#bMonth').value || monthStr()), '_blank'));
-  load();
+  reload();
 
   async function load() {
     const b = await api('/billing?month=' + ($('#bMonth').value || monthStr()));
@@ -1754,6 +2049,87 @@ ROUTES.billing = async function () {
       ${inv.notes?`<p class="small muted" style="margin-top:8px">${esc(inv.notes)}</p>`:''}</div>`;
 
     $('#bBody').innerHTML = html;
+  }
+};
+
+// ===========================================================================
+// FINANCE — full P&L, revenue down to net profit (Drona internal)
+// ===========================================================================
+ROUTES.finance = async function () {
+  const v = $('#view');
+  v.innerHTML = topbar('Finance', 'Full profit & loss — revenue through to net profit (Drona internal).') +
+    `<div class="card noprint"><div class="btn-row">
+       <label class="small" style="margin:0">Month</label><input type="month" id="fMonth" value="${monthStr()}" style="width:auto">
+       <button class="btn ghost" id="fPrint">🖨 Print</button></div></div>
+     <div id="fBody"><div class="empty">Loading…</div></div>`;
+  const reload = () => paneLoad('#fBody', load);
+  $('#fMonth').addEventListener('change', reload);
+  $('#fPrint').addEventListener('click', () => window.print());
+
+  const pctf = (x) => (x * 100).toFixed(1) + '%';
+  const tint = (n) => (n >= 0 ? 'ok' : 'bad');
+  // Costs render as the negative amounts they are, so the column reads as one
+  // running subtraction from revenue down to net profit.
+  const neg = (n) => (n ? '−' + inr(n) : inr(0));
+  const indent = (label, amt, sub) =>
+    `<tr><td style="padding-left:18px">${label}${sub ? ` <span class="muted small">${sub}</span>` : ''}</td><td class="num">${amt}</td></tr>`;
+  const total = (label, amt, shade) =>
+    `<tr style="font-weight:700;border-top:2px solid var(--line)${shade ? ';background:#f8fafc' : ''}"><td>${label}</td><td class="num">${amt}</td></tr>`;
+  const costRows = (lines) => (lines.length
+    ? lines.map(l => `<tr><td style="padding-left:18px">${esc(l.name)}${l.computed ? ' <span class="tag">auto</span>' : ''}${
+        l.detail ? `<div class="small muted">${esc(l.detail)}</div>` : ''}</td><td class="num">${neg(l.amount)}</td></tr>`).join('')
+    : `<tr><td style="padding-left:18px" class="muted">None configured.</td><td class="num">${inr(0)}</td></tr>`);
+
+  reload();
+
+  async function load() {
+    const f = await api('/finance?month=' + ($('#fMonth').value || monthStr()));
+    const r = f.revenue_breakdown, q = f.quantities, pay = f.payroll;
+
+    let html = `<div class="grid g4 kpigrid" style="margin-bottom:14px">
+      <div class="kpi tint-brand"><div class="l">Revenue</div><div class="v">${inr(f.revenue)}</div><div class="sub muted">service + transport</div></div>
+      <div class="kpi tint-${tint(f.gross_profit)}"><div class="l">Gross Profit</div><div class="v">${inr(f.gross_profit)}</div><div class="sub muted">${pctf(f.gross_margin)} margin</div></div>
+      <div class="kpi tint-${tint(f.ebitda)}"><div class="l">EBITDA</div><div class="v">${inr(f.ebitda)}</div><div class="sub muted">${pctf(f.ebitda_margin)} margin</div></div>
+      <div class="kpi tint-${tint(f.net_profit)}"><div class="l">Net Profit</div><div class="v">${inr(f.net_profit)}</div><div class="sub muted">${pctf(f.net_margin)} margin</div></div>
+    </div>`;
+
+    html += `<div class="card"><h3>Profit &amp; Loss — ${esc(f.month)}</h3><table><tbody>
+      <tr style="font-weight:700"><td>REVENUE</td><td class="num">${inr(f.revenue)}</td></tr>
+      ${indent('Loading', inr(r.loading), fmt(q.load_parts) + ' parts')}
+      ${indent('Unloading', inr(r.unloading), fmt(q.unload_ton) + ' ton')}
+      ${indent('QC / PDI', inr(r.qc), fmt(q.qc_billed) + ' parts')}
+      ${indent('Transport', inr(r.transport))}
+
+      <tr style="font-weight:600"><td colspan="2" style="padding-top:12px">DIRECT COSTS</td></tr>
+      ${costRows(f.direct_lines)}
+      <tr><td class="right muted">Total direct cost</td><td class="num">${neg(f.direct_total)}</td></tr>
+      ${total('GROSS PROFIT', `${inr(f.gross_profit)} <span class="muted">(${pctf(f.gross_margin)})</span>`)}
+
+      <tr style="font-weight:600"><td colspan="2" style="padding-top:12px">INDIRECT COSTS</td></tr>
+      ${costRows(f.indirect_lines)}
+      <tr><td class="right muted">Total indirect cost</td><td class="num">${neg(f.indirect_total)}</td></tr>
+      ${total('EBITDA', `${inr(f.ebitda)} <span class="muted">(${pctf(f.ebitda_margin)})</span>`, true)}
+
+      ${indent('Depreciation', neg(f.depreciation))}
+      ${indent('Amortisation', neg(f.amortisation))}
+      ${total('EBIT', inr(f.ebit))}
+      ${indent('Interest', neg(f.interest))}
+      ${total('PBT', inr(f.pbt))}
+      ${indent(`Tax @ ${f.tax_pct}%`, neg(f.tax))}
+      ${total('NET PROFIT', `${inr(f.net_profit)} <span class="muted">(${pctf(f.net_margin)})</span>`, true)}
+    </tbody></table>
+    <p class="small muted">Cost lines, employer PF/ESI, depreciation, amortisation, interest and tax are editable in Settings → Finance.</p></div>`;
+
+    html += `<div class="card"><h3>Payroll — actual <span class="muted small">(from attendance)</span></h3><table><tbody>
+      <tr><td>Wages paid <span class="muted small">gross + OT</span></td><td class="num">${inr(pay.wages)}</td></tr>
+      <tr><td>Employer PF</td><td class="num">${inr(pay.employer_pf)}</td></tr>
+      <tr><td>Employer ESI</td><td class="num">${inr(pay.employer_esi)}</td></tr>
+      ${total('Cost to company', inr(pay.total))}
+    </tbody></table>
+    <p class="small ${pay.days_marked ? 'muted' : 'flag'}">${pay.worker_count} active worker(s) · attendance marked on <b>${pay.days_marked}</b> day(s) this month · ${fmt(pay.present_days)} present-day(s) counted.${
+      pay.days_marked ? '' : ' No attendance marked yet — payroll cost stays ₹0 until the register is filled in.'}</p></div>`;
+
+    $('#fBody').innerHTML = html;
   }
 };
 

@@ -71,6 +71,26 @@ module.exports = {
   // transport_monthly = 0 means treat transport as pass-through (cost = transport revenue).
   COSTS: { manpower_monthly: 163000, overhead_monthly: 77000, transport_monthly: 0 },
 
+  // ---- Finance (full P&L statement, setting key 'finance') ----------------
+  // Drives the Finance page. Each cost line is tagged DIRECT or INDIRECT and is
+  // admin-editable. Payroll and transport are deliberately NOT listed here —
+  // the statement computes them: payroll from actual attendance, transport as
+  // a pass-through of transport revenue. `overhead_monthly` above seeds the
+  // starting INDIRECT line so the page opens with real numbers.
+  //
+  // Employer PF/ESI are the *company's* contributions, on top of the wages
+  // paid. They are distinct from the employee deductions in calc.wageRow, which
+  // are withheld from gross rather than added to cost.
+  FINANCE: {
+    cost_lines: [{ name: 'Overhead', amount: 77000, type: 'INDIRECT' }],
+    employer_pf_pct: 13,       // % of earned basic
+    employer_esi_pct: 3.25,    // % of (gross + OT)
+    depreciation_monthly: 0,
+    amortisation_monthly: 0,
+    interest_monthly: 0,
+    tax_pct: 0,                // % of PBT, charged only when PBT is positive
+  },
+
   // ---- Invoice ------------------------------------------------------------
   INVOICE: { gst_pct: 0, gstin: '', bill_to: 'JMC Works Pvt. Ltd.', notes: 'Subject to 3-month review per LOI.' },
   // Bill QC at the guaranteed minimum (max of actual vs MG) per operating day.

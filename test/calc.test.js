@@ -1,7 +1,7 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert');
-const { qcBilled, gst, wageRow } = require('../calc');
+const { qcBilled, gst, wageRow, pnlStatement } = require('../calc');
 
 test('qcBilled applies the MG floor per day when billing is on', () => {
   const r = qcBilled([500, 700, 600], 600, true);
@@ -40,6 +40,53 @@ test('wageRow: daily wage with overtime, ESI below ceiling', () => {
   assert.equal(r.pf, 0);
   assert.equal(r.esi, Math.round((10000 + otPay) * 0.0075));
   assert.equal(r.net, 10000 + otPay - r.esi);
+});
+
+test('wageRow returns earned basic so employer PF can be charged on it', () => {
+  const w = { wage_type: 'MONTHLY', monthly_gross: 26000, basic: 13000, pf_applicable: 1, esi_applicable: 0 };
+  assert.equal(wageRow(w, 13, 0, 26).basic_earned, 6500); // half the standard days
+});
+
+test('pnlStatement walks revenue down to net profit', () => {
+  const r = pnlStatement({
+    revenue: 1000000,
+    direct: [{ name: 'Payroll', amount: 400000 }, { name: 'Transport', amount: 100000 }],
+    indirect: [{ name: 'Overhead', amount: 200000 }],
+    depreciation: 50000, amortisation: 10000, interest: 40000, taxPct: 25,
+  });
+  assert.equal(r.direct_total, 500000);
+  assert.equal(r.gross_profit, 500000);
+  assert.equal(r.indirect_total, 200000);
+  assert.equal(r.ebitda, 300000);
+  assert.equal(r.ebit, 240000);          // 300000 − 50000 − 10000
+  assert.equal(r.pbt, 200000);           // 240000 − 40000 interest
+  assert.equal(r.tax, 50000);            // 25% of a positive PBT
+  assert.equal(r.net_profit, 150000);
+});
+
+test('pnlStatement reports margins as fractions of revenue', () => {
+  const r = pnlStatement({ revenue: 1000, direct: [{ amount: 400 }], indirect: [{ amount: 100 }] });
+  assert.equal(r.gross_margin, 0.6);
+  assert.equal(r.ebitda_margin, 0.5);
+  assert.equal(r.net_margin, 0.5);       // no D&A, interest or tax configured
+});
+
+test('pnlStatement charges no tax on a loss and never divides by zero revenue', () => {
+  const loss = pnlStatement({ revenue: 100, direct: [{ amount: 500 }], taxPct: 30 });
+  assert.equal(loss.gross_profit, -400);
+  assert.equal(loss.tax, 0);             // a loss-making month carries no tax
+  assert.equal(loss.net_profit, -400);
+
+  const empty = pnlStatement({ revenue: 0, indirect: [{ amount: 250 }] });
+  assert.equal(empty.ebitda, -250);
+  assert.equal(empty.ebitda_margin, 0);  // 0 rather than NaN/Infinity
+});
+
+test('pnlStatement tolerates missing arguments', () => {
+  const r = pnlStatement();
+  assert.equal(r.revenue, 0);
+  assert.equal(r.net_profit, 0);
+  assert.deepStrictEqual(r.direct_lines, []);
 });
 
 test('wageRow: partial-month monthly worker prorates gross and basic', () => {

@@ -469,6 +469,56 @@ input[type=month],input[type=date],input[type=number]{font-family:var(--font-mon
 @keyframes sheetUp{from{transform:translateY(100%);opacity:.6}to{transform:none;opacity:1}}
 
 /* ===========================================================================
+   Analytics — trend badges, analyst notes, health strip, chart frames
+   =========================================================================== */
+/* Chart.js draws into a canvas that fills this box; the parent sets the height
+   so the chart has a definite size to lay out against. */
+.chartbox{position:relative;width:100%}
+.chartbox canvas{max-width:100%}
+
+/* A card that leads the page — the signal edge marks it as the summary. */
+.card.accent{border-left:3px solid transparent;border-image:var(--signal) 1;border-left-width:3px}
+
+.trend{
+  display:inline-flex;align-items:center;gap:3px;margin-left:6px;
+  font-size:11px;font-weight:700;letter-spacing:.02em;padding:1px 6px;border-radius:999px;
+  font-family:'IBM Plex Mono',ui-monospace,monospace}
+.trend.up{color:#15803d;background:rgba(54,179,126,.14)}
+.trend.down{color:#b91c1c;background:rgba(220,38,38,.12)}
+.trend.flat{color:#64748b;background:rgba(100,116,139,.12)}
+
+/* Analyst findings — one row per finding, colour-keyed by severity. */
+.insights{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:8px}
+.ins{display:flex;gap:10px;align-items:flex-start;padding:9px 11px;border-radius:10px;
+  background:#f8fafc;border-left:3px solid var(--line)}
+.ins .ico{
+  flex:0 0 18px;width:18px;height:18px;border-radius:50%;margin-top:1px;
+  display:grid;place-items:center;font-size:11px;font-weight:800;color:#fff;line-height:1}
+.ins b{display:block;font-size:12px;letter-spacing:.01em}
+.ins.good{border-left-color:#15803d;background:rgba(54,179,126,.08)}
+.ins.good .ico{background:#15803d}
+.ins.warn{border-left-color:#b45309;background:rgba(217,119,6,.08)}
+.ins.warn .ico{background:#b45309}
+.ins.bad{border-left-color:#b91c1c;background:rgba(220,38,38,.08)}
+.ins.bad .ico{background:#b91c1c}
+.ins.info{border-left-color:var(--brand);background:rgba(47,99,196,.07)}
+.ins.info .ico{background:var(--brand)}
+
+/* Compact at-a-glance counters. */
+.healthstrip{display:grid;grid-template-columns:repeat(auto-fit,minmax(132px,1fr));gap:10px}
+.hchip{padding:10px 12px;border-radius:10px;background:#f8fafc;border:1px solid var(--line);text-align:center}
+.hchip .hv{font-size:20px;font-weight:800;font-family:'Archivo',system-ui,sans-serif;line-height:1.1}
+.hchip .hl{font-size:10.5px;color:#64748b;margin-top:3px;letter-spacing:.02em}
+.hchip.ok .hv{color:#15803d}
+.hchip.warn .hv{color:#b45309}
+.hchip.bad .hv{color:#b91c1c}
+
+@media (max-width:720px){
+  .healthstrip{grid-template-columns:repeat(auto-fit,minmax(104px,1fr))}
+  .hchip .hv{font-size:17px}
+}
+
+/* ===========================================================================
    Print (MIS / reports)
    =========================================================================== */
 .printonly{display:none}
@@ -481,4 +531,9 @@ input[type=month],input[type=date],input[type=number]{font-family:var(--font-mon
   body{background:#fff}
   .grid.g4{grid-template-columns:repeat(4,1fr)!important}
   .grid.g2{grid-template-columns:1fr 1fr!important}
+  /* Canvases rasterise at their on-screen size; keep them inside the page. */
+  .chartbox{height:200px!important}
+  .chartbox canvas{width:100%!important;height:100%!important}
+  .ins{background:#fff!important;break-inside:avoid}
+  .hchip{background:#fff!important}
 }
